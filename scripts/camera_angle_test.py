@@ -2,7 +2,7 @@ import gymnasium as gym
 from metaworld.sensors.visual import DepthCameraSensor
 import numpy as np
 
-env = gym.make('Meta-World/MT1', env_name='reach-v3')
+env = gym.make('Meta-World/MT1', env_name='reach-v3', camera_id="corner3", render_mode="rgb_array")
 sensor = DepthCameraSensor('gripper_depth_cam', 64, 64)
 
 env.reset()
@@ -13,10 +13,10 @@ sensor.update(env)
 depth1 = sensor.read().copy()
 
 # Move gripper
-for _ in range(10):
+for _ in range(100):
   action = [0.1, 0, 0, 0]  # Move forward in X
-  env.step(action)
-
+  x = env.step(action)
+  env.render()
 # Get new depth - should be DIFFERENT (camera moved)
 sensor.update(env)
 depth2 = sensor.read()
