@@ -5,11 +5,13 @@ with additional sensory modalities beyond proprioceptive observations.
 """
 
 from metaworld.sensors.base import SensorBase
+from metaworld.sensors.force_torque_sensor import ForceTorqueSensor
 from metaworld.sensors.tactile import GripperTouchSensor
 from metaworld.sensors.visual import DepthCameraSensor
 
 __all__ = [
     "SensorBase",
+    "ForceTorqueSensor",
     "GripperTouchSensor",
     "DepthCameraSensor",
 ]

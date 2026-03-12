@@ -74,9 +74,7 @@ class TestDepthCameraSensor:
         env = gym.make("Meta-World/MT1", env_name="reach-v3")
 
         # Create sensor
-        sensor = DepthCameraSensor(
-            camera_name="gripper_depth_cam", height=64, width=64
-        )
+        sensor = DepthCameraSensor(camera_name="gripper_depth_cam", height=64, width=64)
 
         # Reset environment and sensor
         env.reset()
@@ -173,12 +171,8 @@ def visualize_depth_camera():
             )
 
         except NotImplementedError:
-            print(
-                "\n   ✗ DepthCameraSensor.update() not implemented yet!"
-            )
-            print(
-                "     Implement the update() method in metaworld/sensors/visual.py"
-            )
+            print("\n   ✗ DepthCameraSensor.update() not implemented yet!")
+            print("     Implement the update() method in metaworld/sensors/visual.py")
             return
         except Exception as e:
             print(f"\n   ✗ Error during sensor update: {e}")
@@ -262,7 +256,7 @@ if __name__ == "__main__":
     # Test observation space integration
     test_observation_space_integration()
 
-    # Run visualization test (requires implementation)
+    # Run visualization test
     print("\n" + "=" * 60)
     response = input(
         "\nRun depth camera visualization? (requires update() implementation) [y/N]: "
