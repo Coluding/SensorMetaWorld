@@ -1,6 +1,6 @@
 """Test script for DepthCameraSensor with reach-v3 environment.
 
-This script tests the depth camera sensor mounted on the gripper.
+This script tests the depth camera sensor using the shared fixed camera.
 Run this after implementing DepthCameraSensor.update().
 
 Usage:
@@ -8,6 +8,8 @@ Usage:
     # Or run directly:
     python tests/sensors/test_depth_camera.py
 """
+
+from types import SimpleNamespace
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -100,6 +102,49 @@ class TestDepthCameraSensor:
         with pytest.raises(RuntimeError, match="read\\(\\) called before reset\\(\\)"):
             sensor.read()
 
+    def test_update_flips_depth_image_vertically(self, monkeypatch):
+        """Test that sensor output is vertically flipped after rendering."""
+        rendered = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
+
+        class DummyViewer:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def render(self, render_mode, camera_id, segmentation):
+                assert render_mode == "depth_array"
+                assert camera_id == 0
+                assert segmentation is True
+                return rendered.copy()
+
+        def fake_resize(image, size):
+            assert size == (3, 2)
+            return image
+
+        monkeypatch.setattr("metaworld.sensors.visual.OffScreenViewer", DummyViewer)
+        monkeypatch.setattr("metaworld.sensors.visual.cv.resize", fake_resize)
+
+        sensor = DepthCameraSensor(camera_name="gripper_depth_cam", height=2, width=3)
+        sensor._camera_id = 0
+
+        dummy_env = SimpleNamespace(
+            unwrapped=SimpleNamespace(
+                mujoco_renderer=SimpleNamespace(
+                    model=object(),
+                    data=object(),
+                    width=3,
+                    height=2,
+                    max_geom=1,
+                    _vopt=object(),
+                )
+            )
+        )
+
+        sensor.update(dummy_env)
+
+        expected_image = np.array([[4.0, 5.0, 6.0], [1.0, 2.0, 3.0]], dtype=np.float32)
+        np.testing.assert_array_equal(sensor.get_depth_as_image(), expected_image)
+        np.testing.assert_array_equal(sensor.read(), expected_image.reshape(-1).astype(np.float64))
+
 
 def visualize_depth_camera():
     """Interactive test: visualize depth camera output.
@@ -137,7 +182,7 @@ def visualize_depth_camera():
     except RuntimeError as e:
         print(f"   ✗ Sensor reset failed: {e}")
         print(
-            "\n   Make sure the camera 'gripper_depth_cam' exists in sawyer_reach_v3.xml"
+            "\n   Make sure the camera 'gripper_depth_cam' exists in the shared Sawyer XML assets"
         )
         return
 

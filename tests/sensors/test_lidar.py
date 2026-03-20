@@ -8,11 +8,160 @@ Usage:
     python tests/sensors/test_lidar.py
 """
 
+import argparse
+from pathlib import Path
+import time
+
 import gymnasium as gym
+import matplotlib
 import numpy as np
 import pytest
 
 from metaworld.sensors.laser import Lidar2DSensor, Lidar3DSensor
+
+# Use a non-interactive backend for headless test environments.
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+def visualize_lidar_2d(sensor: Lidar2DSensor, output_path: str | Path) -> Path:
+    """Save a 2D LiDAR scan visualization as an image file."""
+    if sensor._distances is None or sensor._ray_dirs_local is None:
+        raise RuntimeError(
+            "Cannot visualize before sensor.reset() and sensor.update()."
+        )
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    endpoints = sensor._ray_dirs_local[:, :2] * sensor._distances[:, None]
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.scatter(
+        endpoints[:, 0], endpoints[:, 1], s=8, c=sensor._distances, cmap="viridis"
+    )
+
+    # Draw a subset of rays to keep the plot readable for dense scans.
+    stride = max(1, sensor.num_rays // 128)
+    sampled = endpoints[::stride]
+    for point in sampled:
+        ax.plot([0.0, point[0]], [0.0, point[1]], color="lightgray", linewidth=0.5)
+
+    ax.scatter([0.0], [0.0], c="red", s=40, label="LiDAR origin")
+    ax.set_title(f"2D LiDAR Scan ({sensor.num_rays} rays)")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right")
+
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def visualize_lidar_3d(
+    sensor: Lidar3DSensor,
+    output_path: str | Path,
+    *,
+    env=None,
+    frame: str = "world",
+) -> Path:
+    """Save a 3D LiDAR point cloud as an ASCII PLY file.
+
+    By default the point cloud is exported in the world frame so it remains
+    understandable without rendering any scene meshes.
+    """
+    if sensor._distances is None or sensor._ray_dirs_local is None:
+        raise RuntimeError(
+            "Cannot visualize before sensor.reset() and sensor.update()."
+        )
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    points_local = sensor._ray_dirs_local * sensor._distances[:, None]
+    if frame == "local":
+        points = points_local
+        origin = np.zeros(3, dtype=np.float64)
+    elif frame == "world":
+        if env is None:
+            raise RuntimeError(
+                "env is required to export 3D LiDAR point clouds in world frame."
+            )
+        site_id = env.unwrapped.model.site(sensor.origin_site).id
+        origin = np.asarray(env.unwrapped.data.site_xpos[site_id], dtype=np.float64)
+        rotation_mat = np.asarray(
+            env.unwrapped.data.site_xmat[site_id].reshape(3, 3),
+            dtype=np.float64,
+        )
+        points = (rotation_mat @ points_local.T).T + origin
+    else:
+        raise ValueError(f"Unsupported frame '{frame}'. Use 'world' or 'local'.")
+
+    # Encode scan points and the LiDAR origin as colored vertices.
+    scan_colors = np.tile(
+        np.array([180, 220, 255], dtype=np.uint8),
+        (points.shape[0], 1),
+    )
+    origin_color = np.array([[255, 0, 0]], dtype=np.uint8)
+    points_with_origin = np.vstack((points, origin[None, :]))
+    colors_with_origin = np.vstack((scan_colors, origin_color))
+
+    with output_path.open("w", encoding="utf-8") as ply_file:
+        ply_file.write("ply\n")
+        ply_file.write("format ascii 1.0\n")
+        ply_file.write(f"element vertex {points_with_origin.shape[0]}\n")
+        ply_file.write("property float x\n")
+        ply_file.write("property float y\n")
+        ply_file.write("property float z\n")
+        ply_file.write("property uchar red\n")
+        ply_file.write("property uchar green\n")
+        ply_file.write("property uchar blue\n")
+        ply_file.write("end_header\n")
+
+        for (x, y, z), (red, green, blue) in zip(
+            points_with_origin, colors_with_origin
+        ):
+            ply_file.write(f"{x:.6f} {y:.6f} {z:.6f} {red} {green} {blue}\n")
+
+    return output_path
+
+
+def inspect_lidar_mount(
+    *,
+    env_name: str = "reach-v3",
+    steps: int = 10_000,
+    sleep_s: float = 0.01,
+) -> None:
+    """Launch a human-rendered MuJoCo session to inspect the LiDAR mount."""
+    env = gym.make(
+        "Meta-World/MT1",
+        env_name=env_name,
+        render_mode="human",
+    )
+    sensor = Lidar3DSensor(origin_site="lidar_origin")
+
+    try:
+        env.reset(seed=42)
+        sensor.reset(env)
+        sensor.update(env)
+
+        site_id = env.unwrapped.model.site("lidar_origin").id
+        site_pos = np.asarray(env.unwrapped.data.site_xpos[site_id], dtype=np.float64)
+        site_mat = np.asarray(
+            env.unwrapped.data.site_xmat[site_id].reshape(3, 3),
+            dtype=np.float64,
+        )
+        print("LiDAR site position:", np.array2string(site_pos, precision=4))
+        print("LiDAR site rotation:\n", np.array2string(site_mat, precision=4))
+
+        zero_action = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        for _ in range(steps):
+            env.step(zero_action)
+            time.sleep(sleep_s)
+    finally:
+        env.close()
 
 
 class TestLidar2DSensor:
@@ -104,6 +253,27 @@ class TestLidar2DSensor:
 
         env.close()
 
+    def test_visualization_file_creation(self, tmp_path: Path):
+        """Test that 2D visualization is written to an image file."""
+        env = gym.make("Meta-World/MT1", env_name="reach-v3")
+        env.reset(seed=42)
+
+        sensor = Lidar2DSensor(
+            origin_site="lidar_origin",
+            num_rays=64,
+            max_range=2.0,
+        )
+        sensor.reset(env)
+        sensor.update(env)
+
+        image_path = visualize_lidar_2d(sensor, tmp_path / "lidar2d_scan.png")
+
+        assert image_path.exists()
+        assert image_path.suffix == ".png"
+        assert image_path.stat().st_size > 0
+
+        env.close()
+
     def test_ray_directions_generation(self):
         """Test that ray directions are generated correctly."""
         sensor = Lidar2DSensor(
@@ -123,12 +293,14 @@ class TestLidar2DSensor:
         # Ray 2: [-1, 0, 0]  (180°)
         # Ray 3: [0, -1, 0]  (270°)
 
-        expected_dirs = np.array([
-            [1.0, 0.0, 0.0],   # 0°
-            [0.0, 1.0, 0.0],   # 90°
-            [-1.0, 0.0, 0.0],  # 180°
-            [0.0, -1.0, 0.0],  # 270°
-        ])
+        expected_dirs = np.array(
+            [
+                [1.0, 0.0, 0.0],  # 0°
+                [0.0, 1.0, 0.0],  # 90°
+                [-1.0, 0.0, 0.0],  # 180°
+                [0.0, -1.0, 0.0],  # 270°
+            ]
+        )
 
         np.testing.assert_array_almost_equal(
             sensor._ray_dirs_local,
@@ -301,7 +473,7 @@ class TestLidar3DSensor:
             num_horizontal_rays=64,
             vertical_fov_degrees=30.0,
             horizontal_fov_degrees=360.0,
-            max_range=2.0,
+            max_range=10.0,
         )
 
         assert sensor.origin_site == "lidar_origin"
@@ -310,7 +482,7 @@ class TestLidar3DSensor:
         assert sensor.total_rays == 16 * 64
         assert sensor.vertical_fov == 30.0
         assert sensor.horizontal_fov == 360.0
-        assert sensor.max_range == 2.0
+        assert sensor.max_range == 10.0
         assert sensor.name == "lidar3d_lidar_origin_16x64rays"
 
     def test_observation_space(self):
@@ -391,6 +563,45 @@ class TestLidar3DSensor:
 
         env.close()
 
+    def test_visualization_file_creation(self, tmp_path: Path):
+        """Test that 3D visualization is written to a point-cloud file."""
+        env = gym.make("Meta-World/MT1", env_name="reach-v3")
+        env.reset(seed=42)
+
+        sensor = Lidar3DSensor(
+            origin_site="lidar_origin",
+            num_vertical_layers=128,
+            num_horizontal_rays=128,
+            max_range=10.0,
+            vertical_fov_degrees=90.0,
+        )
+        sensor.reset(env)
+        sensor.update(env)
+
+        cloud_path = visualize_lidar_3d(
+            sensor,
+            tmp_path / "lidar3d_scan.ply",
+            env=env,
+            frame="world",
+        )
+
+        assert cloud_path.exists()
+        assert cloud_path.suffix == ".ply"
+        assert cloud_path.stat().st_size > 0
+
+        with cloud_path.open("r", encoding="utf-8") as ply_file:
+            header_lines = [next(ply_file).strip() for _ in range(10)]
+
+        assert header_lines[0] == "ply"
+        assert header_lines[1] == "format ascii 1.0"
+        assert header_lines[2] == f"element vertex {sensor.total_rays + 1}"
+        assert header_lines[6] == "property uchar red"
+        assert header_lines[7] == "property uchar green"
+        assert header_lines[8] == "property uchar blue"
+        assert header_lines[9] == "end_header"
+
+        env.close()
+
     def test_spherical_ray_directions_generation(self):
         """Test that ray directions are generated correctly in spherical coordinates."""
         sensor = Lidar3DSensor(
@@ -448,11 +659,7 @@ class TestLidar3DSensor:
         sensor.reset(env)
 
         # Vertical elevation should range from -10° to +10°
-        v_angles = np.linspace(
-            -np.deg2rad(10.0),
-            np.deg2rad(10.0),
-            5
-        )
+        v_angles = np.linspace(-np.deg2rad(10.0), np.deg2rad(10.0), 5)
 
         # Check Z components match expected elevations
         for layer_idx, v_angle_expected in enumerate(v_angles):
@@ -491,7 +698,9 @@ class TestLidar3DSensor:
 
         # Calculate horizontal angles from XY components
         h_angles_measured = np.arctan2(first_layer_rays[:, 1], first_layer_rays[:, 0])
-        h_angles_measured = np.where(h_angles_measured < 0, h_angles_measured + 2*np.pi, h_angles_measured)
+        h_angles_measured = np.where(
+            h_angles_measured < 0, h_angles_measured + 2 * np.pi, h_angles_measured
+        )
 
         np.testing.assert_array_almost_equal(
             h_angles_measured,
@@ -507,8 +716,8 @@ class TestLidar3DSensor:
         env.reset()
 
         configs = [
-            (4, 16),   # 4 layers, 16 rays/layer
-            (8, 32),   # 8 layers, 32 rays/layer
+            (4, 16),  # 4 layers, 16 rays/layer
+            (8, 32),  # 8 layers, 32 rays/layer
             (16, 64),  # 16 layers, 64 rays/layer
         ]
 
@@ -672,4 +881,3 @@ class TestLidar3DSensor:
         assert np.abs(z_layer_0[0] - z_layer_1[0]) > 1e-5
 
         env.close()
-

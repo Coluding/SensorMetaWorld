@@ -139,7 +139,9 @@ class DepthCameraSensor(SensorBase):
         )
 
         _depth_img = viewer.render("depth_array", self._camera_id, True)
-        _depth_img = cv.resize(_depth_img, (self.height, self.width))
+        # OpenCV expects resize dimensions as (width, height).
+        _depth_img = cv.resize(_depth_img, (self.width, self.height))
+        _depth_img = np.flipud(_depth_img)
 
         if self.normalize:
             _depth_img = np.clip(_depth_img, self.near_plane, self.far_plane)
@@ -160,7 +162,7 @@ class DepthCameraSensor(SensorBase):
         """Return current depth image as flattened array.
 
         Returns:
-            Flattened depth image of shape (height * width,).
+            Flattened vertically flipped depth image of shape (height * width,).
 
         Raises:
             RuntimeError: If read() is called before reset().
@@ -229,7 +231,8 @@ class DepthCameraSensor(SensorBase):
 
         Note:
             This is a utility method for debugging/visualization, not part of
-            the observation returned to the agent.
+            the observation returned to the agent. The image is vertically
+            flipped relative to MuJoCo's raw render output.
         """
         if self._depth_buffer is None:
             raise RuntimeError("No depth data available. Call update() first.")
@@ -265,4 +268,3 @@ class DepthCameraSensor(SensorBase):
         colored = cmap(depth_normalized)
         # Convert to uint8 RGB (drop alpha channel)
         return (colored[:, :, :3] * 255).astype(np.uint8)
-

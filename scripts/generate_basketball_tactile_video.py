@@ -209,7 +209,7 @@ def _figure_to_rgb_frame(fig: plt.Figure) -> np.ndarray:
     """Convert a matplotlib figure canvas into an `H x W x 3` uint8 frame."""
     fig.canvas.draw()
     width, height = fig.canvas.get_width_height()
-    rgb = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    rgb = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
     frame = rgb.reshape((height, width, 3))
     return np.ascontiguousarray(frame)
 
@@ -286,8 +286,10 @@ def main() -> None:
             obs, _, terminated, truncated, _ = env.step(action)
             sensor.update(env)
 
-            tactile = sensor.read().astype(np.float32).reshape(
-                2, sensor.image_size[0], sensor.image_size[1]
+            tactile = (
+                sensor.read()
+                .astype(np.float32)
+                .reshape(2, sensor.image_size[0], sensor.image_size[1])
             )
             left_tactile = tactile[0]
             right_tactile = tactile[1]
@@ -309,9 +311,7 @@ def main() -> None:
             rgb_artist.set_data(rgb_frame)
             left_artist.set_data(left_color)
             right_artist.set_data(right_color)
-            axes[0].set_title(
-                f"RGB Render ({args.camera_name}) step={step_idx + 1}"
-            )
+            axes[0].set_title(f"RGB Render ({args.camera_name}) step={step_idx + 1}")
             axes[1].set_title(
                 f"Left in={left_inside.max():.3f} out={left_outside.max():.3f}"
             )
