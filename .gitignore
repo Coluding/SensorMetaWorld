@@ -156,3 +156,7 @@ flake.lock
 .envrc
 
 CLAUDE.md
+
+*.mp4
+*.png
+*.jpg

@@ -8,17 +8,16 @@ from metaworld.sensors.base import SensorBase
 from metaworld.sensors.force_torque_sensor import ForceTorqueSensor
 from metaworld.sensors.kinematic import FutureStateIKSensor
 from metaworld.sensors.laser import Lidar2DSensor, Lidar3DSensor
-from metaworld.sensors.tactile import GripperTouchSensor
+from metaworld.sensors.tactile import GripperTouchSensor, ImageTactileSensor
 from metaworld.sensors.visual import DepthCameraSensor
 
 __all__ = [
     "SensorBase",
     "ForceTorqueSensor",
     "GripperTouchSensor",
+    "ImageTactileSensor",
     "DepthCameraSensor",
     "FutureStateIKSensor",
-    "GripperTouchSensor",
-    "DepthCameraSensor",
     "Lidar2DSensor",
     "Lidar3DSensor",
 ]
