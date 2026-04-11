@@ -4,9 +4,7 @@ This module contains camera-based sensors including RGB, depth, and segmentation
 """
 
 from __future__ import annotations
-import matplotlib.pyplot as plt
-from typing import TYPE_CHECKING, Literal
-from gymnasium.envs.mujoco.mujoco_rendering import OffScreenViewer
+from typing import TYPE_CHECKING
 import mujoco
 import numpy as np
 import numpy.typing as npt
@@ -91,6 +89,7 @@ class DepthCameraSensor(SensorBase):
         # Internal state
         self._depth_buffer: npt.NDArray[np.float32] | None = None
         self._camera_id: int | None = None
+        self._warned_render_failure = False
 
     @property
     def name(self) -> str:
@@ -128,17 +127,36 @@ class DepthCameraSensor(SensorBase):
             This uses MuJoCo's offscreen rendering which is relatively expensive.
             The depth buffer is cached until the next update() call.
         """
-        renderer: mujoco.Renderer = env.unwrapped.mujoco_renderer
-        viewer = OffScreenViewer(
-            renderer.model,
-            renderer.data,
-            renderer.width,
-            renderer.height,
-            renderer.max_geom,
-            renderer._vopt,
-        )
+        renderer = env.unwrapped.mujoco_renderer
+        _depth_img = None
 
-        _depth_img = viewer.render("depth_array", self._camera_id, True)
+        try:
+            # Reuse the existing RGB offscreen viewer instead of creating a
+            # separate depth viewer. In multi-process collection that extra
+            # framebuffer can fail to initialize with "framebuffer is not
+            # complete", while the already-active RGB viewer is stable.
+            get_viewer = getattr(renderer, "_get_viewer", None)
+            if callable(get_viewer):
+                viewer = get_viewer(render_mode="rgb_array")
+                viewer.make_context_current()
+                _depth_img = viewer.render(
+                    render_mode="depth_array",
+                    camera_id=self._camera_id,
+                )
+            else:
+                render_fn = getattr(renderer, "render", None)
+                if callable(render_fn):
+                    _depth_img = render_fn(render_mode="depth_array")
+        except Exception as exc:
+            if not self._warned_render_failure:
+                print(
+                    f"[DepthCameraSensor] Failed to render depth for "
+                    f"camera '{self.camera_name}': {exc}. Filling zeros.",
+                    flush=True,
+                )
+                self._warned_render_failure = True
+            _depth_img = np.zeros((self.height, self.width), dtype=np.float32)
+
         # OpenCV expects resize dimensions as (width, height).
         _depth_img = cv.resize(_depth_img, (self.width, self.height))
         _depth_img = np.flipud(_depth_img)

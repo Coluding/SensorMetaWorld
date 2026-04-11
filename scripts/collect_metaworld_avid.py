@@ -1,37 +1,53 @@
 import metaworld
+import metaworld.policies as mw_policies
 import numpy as np
-import h5py
 import cv2
 import random
 import argparse
 import multiprocessing
 import os
-import glob
-from math import ceil
-from typing import Any
 import mujoco
-from metaworld.policies import *
 from metaworld_policies import (
     MetaWorldPolicy,
-    RandomWalk,
     NoisyExpertPolicy,
+    RandomWalk,
 )
+from metaworld.sensors.tactile_digit_sensor import TactileDigitSensor
+from metaworld.sensors.visual import DepthCameraSensor
 
 from pathlib import Path
 
 # Defaults
-DEFAULT_DATASET_PATH = "data/metaworld/metaworld_corner.hdf5"
+DEFAULT_DATASET_PATH = "data/metaworld/metaworld_corner2.hdf5"
 DEFAULT_TEMP_DIR = "data/metaworld/temp/"
-DEFAULT_EPISODES_EXPERT = 1
-DEFAULT_EPISODES_RANDOM = 1
-MAX_STEPS = 256
-# Image size for rendering (width, height) - Dynamicrafter default is 320x512
-IMG_SIZE = (256, 256)
-# Kinematics-only IK defaults (no dynamics / no collision simulation).
-KIN_IK_ITERS = 12
-KIN_IK_STEP_SIZE = 0.6
-KIN_IK_DAMPING = 1e-4
-KIN_IK_TOL = 1e-4
+DEFAULT_NUM_EPISODES = 1
+DEFAULT_EXPERT_NOISE_MIN = 0.1
+DEFAULT_EXPERT_NOISE_MAX = 0.25
+DEFAULT_RANDOMIZE_EVERY_RESET = True
+DEFAULT_RANDOM_WALK_DIRECTION_STDDEV = 0.45
+DEFAULT_RANDOM_WALK_GRAVITY_STRENGTH = 0.01
+DEFAULT_RANDOM_WALK_LEVY_ALPHA = 1.35
+DEFAULT_RANDOM_WALK_MIN_STEP = 1.0
+DEFAULT_RANDOM_WALK_MAX_STEP = 4.0
+MAX_STEPS = 200
+RGB_CAMERA_NAME = "corner2"
+DEPTH_CAMERA_NAME = RGB_CAMERA_NAME
+RGB_IMAGE_WIDTH = 128
+RGB_IMAGE_HEIGHT = 128
+DEPTH_IMAGE_WIDTH = 128
+DEPTH_IMAGE_HEIGHT = 128
+TACTILE_RESOLUTION = 64
+
+
+def _require_h5py():
+    try:
+        import h5py
+    except ImportError as exc:
+        raise ImportError(
+            "h5py is required for dataset HDF5 writing. "
+            "Install it to use full_data_collection or worker_process."
+        ) from exc
+    return h5py
 
 
 def get_policy_for_task(task_name):
@@ -42,165 +58,188 @@ def get_policy_for_task(task_name):
     camel_case = "".join(x.title() for x in base_name.split("-"))
     policy_name = f"Sawyer{camel_case}V3Policy"
 
-    if policy_name in globals():
-        return globals()[policy_name]()
-    return None
+    policy_cls = getattr(mw_policies, policy_name, None)
+    return policy_cls() if policy_cls is not None else None
 
 
-def _build_arm_kinematics_cache(env) -> dict[str, Any]:
-    """Pre-compute index lookups for Sawyer arm joints and TCP sites."""
-    model = env.model
-    arm_joint_names = [f"right_j{i}" for i in range(7)]
-    qpos_indices = []
-    dof_indices = []
-    joint_lower = []
-    joint_upper = []
-
-    for joint_name in arm_joint_names:
-        joint_id = model.joint(joint_name).id
-        qpos_indices.append(int(model.jnt_qposadr[joint_id]))
-        dof_indices.append(int(model.jnt_dofadr[joint_id]))
-        joint_lower.append(float(model.jnt_range[joint_id, 0]))
-        joint_upper.append(float(model.jnt_range[joint_id, 1]))
-
-    return {
-        "qpos_indices": np.array(qpos_indices, dtype=np.int64),
-        "dof_indices": np.array(dof_indices, dtype=np.int64),
-        "joint_lower": np.array(joint_lower, dtype=np.float64),
-        "joint_upper": np.array(joint_upper, dtype=np.float64),
-        "right_site_id": env.model.site("rightEndEffector").id,
-        "left_site_id": env.model.site("leftEndEffector").id,
-    }
+def _set_randomized_resets(env, enabled: bool) -> None:
+    """Allow fresh object/goal placement samples on every reset."""
+    env._freeze_rand_vec = not enabled
 
 
-def _predict_kinematics_no_sim(
-    env,
-    kin_data: mujoco.MjData,
-    kin_cache: dict[str, Any],
-    action: np.ndarray,
-) -> np.ndarray:
-    """Predict next arm joint positions from action using kinematics only.
+def _build_episode_policy_schedule(num_episodes: int) -> list[str]:
+    """Return a shuffled 50/50-ish split of noisy expert and random walk."""
+    num_noisy_expert = (num_episodes + 1) // 2
+    num_random_walk = num_episodes // 2
+    schedule = (
+        ["noisy_expert"] * num_noisy_expert
+        + ["random_walk"] * num_random_walk
+    )
+    random.shuffle(schedule)
+    return schedule
 
-    This intentionally does not run MuJoCo dynamics (`env.step` / `mj_step`).
-    """
-    model = env.model
-    arm_qpos_idx = kin_cache["qpos_indices"]
-    arm_dof_idx = kin_cache["dof_indices"]
-    lower = kin_cache["joint_lower"]
-    upper = kin_cache["joint_upper"]
-    right_site_id = kin_cache["right_site_id"]
-    left_site_id = kin_cache["left_site_id"]
 
-    # Copy current state into standalone kinematics data.
-    kin_data.qpos[:] = env.data.qpos
-    kin_data.qvel[:] = env.data.qvel
-    if model.nmocap > 0:
-        kin_data.mocap_pos[:] = env.data.mocap_pos
-        kin_data.mocap_quat[:] = env.data.mocap_quat
+def _make_random_walk_policy(args, episode_seed: int | None = None) -> RandomWalk:
+    """Create a broad random-walk controller for workspace exploration."""
+    return RandomWalk(
+        direction_policy="gravity",
+        step_length_policy="levy",
+        direction_kwargs={
+            "stddev": args.random_walk_direction_stddev,
+            "gravity_strength": args.random_walk_gravity_strength,
+        },
+        step_length_kwargs={
+            "alpha": args.random_walk_levy_alpha,
+            "min_step": args.random_walk_min_step,
+            "max_step": args.random_walk_max_step,
+        },
+        seed=episode_seed,
+    )
 
-    mujoco.mj_fwdPosition(model, kin_data)
 
-    action_xyz = np.clip(np.asarray(action[:3], dtype=np.float64), -1.0, 1.0)
-    pos_delta = action_xyz * float(env.action_scale)
-
-    if model.nmocap > 0:
-        target_tcp = np.clip(
-            kin_data.mocap_pos[0] + pos_delta,
-            env.mocap_low,
-            env.mocap_high,
+def _make_policy_for_episode(env_name: str, args, policy_type: str):
+    if policy_type == "noisy_expert":
+        expert_policy = get_policy_for_task(env_name)
+        if expert_policy is None:
+            raise ValueError(f"No scripted policy available for {env_name}")
+        noise_scale = random.uniform(
+            args.expert_noise_min,
+            args.expert_noise_max,
         )
-    else:
-        right_pos = kin_data.site_xpos[right_site_id]
-        left_pos = kin_data.site_xpos[left_site_id]
-        target_tcp = 0.5 * (right_pos + left_pos) + pos_delta
+        return (
+            NoisyExpertPolicy(expert_policy, noise_scale=noise_scale),
+            {
+                "policy_type": "noisy_expert",
+                "noise_scale": noise_scale,
+            },
+        )
 
-    qpos_work = kin_data.qpos.copy()
-    jac_right = np.zeros((3, model.nv), dtype=np.float64)
-    jac_left = np.zeros((3, model.nv), dtype=np.float64)
+    if policy_type == "random_walk":
+        episode_seed = random.randint(0, 2**31 - 1)
+        return (
+            _make_random_walk_policy(args, episode_seed=episode_seed),
+            {
+                "policy_type": "random_walk",
+                "direction_policy": "gravity",
+                "step_length_policy": "levy",
+                "direction_stddev": args.random_walk_direction_stddev,
+                "gravity_strength": args.random_walk_gravity_strength,
+                "levy_alpha": args.random_walk_levy_alpha,
+                "min_step": args.random_walk_min_step,
+                "max_step": args.random_walk_max_step,
+                "random_walk_seed": episode_seed,
+            },
+        )
 
-    for _ in range(KIN_IK_ITERS):
-        kin_data.qpos[:] = qpos_work
-        mujoco.mj_fwdPosition(model, kin_data)
-
-        right_pos = kin_data.site_xpos[right_site_id]
-        left_pos = kin_data.site_xpos[left_site_id]
-        tcp_pos = 0.5 * (right_pos + left_pos)
-        pos_error = target_tcp - tcp_pos
-
-        if np.linalg.norm(pos_error) <= KIN_IK_TOL:
-            break
-
-        jac_right.fill(0.0)
-        jac_left.fill(0.0)
-        mujoco.mj_jacSite(model, kin_data, jac_right, None, right_site_id)
-        mujoco.mj_jacSite(model, kin_data, jac_left, None, left_site_id)
-
-        jac_tcp = 0.5 * (jac_right + jac_left)
-        j_arm = jac_tcp[:, arm_dof_idx]
-        # Damped least-squares IK update in joint space.
-        jj_t = j_arm @ j_arm.T
-        damped = jj_t + KIN_IK_DAMPING * np.eye(3, dtype=np.float64)
-        dq = j_arm.T @ np.linalg.solve(damped, pos_error)
-
-        qpos_work[arm_qpos_idx] += KIN_IK_STEP_SIZE * dq
-        qpos_work[arm_qpos_idx] = np.clip(qpos_work[arm_qpos_idx], lower, upper)
-
-    return qpos_work[arm_qpos_idx].copy()
+    raise ValueError(f"Unknown policy_type: {policy_type}")
 
 
-def collect_episode(env, policy: MetaWorldPolicy, policy_type: str, task_name: str):
+def _initialize_policy_reference_position(
+    env,
+    policy: MetaWorldPolicy,
+    obs: np.ndarray,
+) -> None:
+    if not hasattr(policy, "set_reference_position"):
+        return
+
+    reference_position = np.asarray(obs[0:3], dtype=np.float32)
+    if isinstance(policy, RandomWalk):
+        hand_low = getattr(env, "hand_low", None)
+        hand_high = getattr(env, "hand_high", None)
+        if hand_low is not None and hand_high is not None:
+            reference_position = (
+                np.asarray(hand_low, dtype=np.float32)
+                + np.asarray(hand_high, dtype=np.float32)
+            ) / 2.0
+
+    policy.set_reference_position(reference_position)
+
+
+def _render_rgb_frame(env) -> np.ndarray:
+    """Render one RGB frame from the environment's configured camera."""
+    frame = None
+    renderer = getattr(env.unwrapped, "mujoco_renderer", None)
+
+    if renderer is not None:
+        get_viewer = getattr(renderer, "_get_viewer", None)
+        if callable(get_viewer):
+            try:
+                viewer = get_viewer(render_mode="rgb_array")
+                # The depth sensor uses its own offscreen OpenGL context. Make the
+                # RGB viewer current again before reading pixels or MuJoCo can
+                # return all-black frames after the first depth render.
+                viewer.make_context_current()
+                frame = viewer.render(
+                    render_mode="rgb_array",
+                    camera_id=renderer.camera_id,
+                )
+            except Exception:
+                frame = None
+
+    if frame is None:
+        frame = env.render()
+    if frame is None:
+        frame = env.render(
+            offscreen=True,
+            resolution=(RGB_IMAGE_WIDTH, RGB_IMAGE_HEIGHT),
+        )
+    frame = cv2.resize(frame, (RGB_IMAGE_WIDTH, RGB_IMAGE_HEIGHT))
+    return cv2.flip(frame, 0)
+
+
+def collect_episode(
+    env,
+    policy: MetaWorldPolicy,
+    task_name: str,
+    depth_sensor: DepthCameraSensor,
+    tactile_sensor: TactileDigitSensor,
+    max_steps: int = MAX_STEPS,
+    reset_seed: int | None = None,
+    policy_name: str = "policy",
+):
     """
     Runs one episode and returns a DICTIONARY.
     Always returns data, even if expert fails.
     """
-    obs, _ = env.reset()
-    if hasattr(policy, "set_reference_position"):
-        policy.set_reference_position(obs[0:3])
+    obs, _ = env.reset(seed=reset_seed)
+    depth_sensor.reset(env)
+    tactile_sensor.reset(env)
+    _initialize_policy_reference_position(env, policy, obs)
 
-    frames = []
-    actions = []
-
-    # State buffers
-    robot_xyz_list, gripper_list = [], []
+    rgb_frames = []
+    depth_frames = []
+    tactile_frames = []
     proprioception_list = []
-    kinematics_prediction_list = []
-    obj1_xyz_list, obj1_quat_list = [], []
-    obj2_xyz_list, obj2_quat_list = [], []
-
-    kin_data = mujoco.MjData(env.model)
-    kin_cache = _build_arm_kinematics_cache(env)
+    gripper_list = []
+    actions = []
+    expert_actions_raw = []
+    expert_actions_clipped = []
+    action_noises = []
 
     success = False
 
-    for _ in range(MAX_STEPS):
-        # Render
-        frame = env.render()
-        if frame is None:
-            frame = env.render(offscreen=True, resolution=IMG_SIZE)
-        else:
-            frame = cv2.resize(frame, IMG_SIZE)
-        frame = cv2.flip(frame, 0)
-        frames.append(frame)
+    for _ in range(max_steps):
+        rgb_frames.append(_render_rgb_frame(env))
 
-        # Split State
-        robot_xyz_list.append(obs[0:3])
-        gripper_list.append(obs[3])
-        obj1_xyz_list.append(obs[4:7])
-        obj1_quat_list.append(obs[7:11])
-        obj2_xyz_list.append(obs[11:14])
-        obj2_quat_list.append(obs[14:18])
+        depth_sensor.update(env)
+        depth_frames.append(depth_sensor.get_depth_as_image().copy())
 
-        action = policy.get_action(obs)
+        tactile_sensor.update(env)
+        left_tactile, right_tactile = tactile_sensor.get_finger_images()
+        tactile_frames.append(np.stack((left_tactile, right_tactile), axis=0))
 
-        # Proprioception is the first 7 elements of qpos (robot joints, no gripper state).
         proprioception_list.append(env.data.qpos[:7].copy())
-        # Kinematics-only joint prediction for the SAME action (no dynamics/collision step).
-        kinematics_prediction_list.append(
-            _predict_kinematics_no_sim(env, kin_data, kin_cache, action)
-        )
+        gripper_list.append(np.float32(obs[3]))
 
-        obs, reward, terminated, truncated, info = env.step(action)
+        action = np.asarray(policy.get_action(obs), dtype=np.float32)
         actions.append(action)
+        if getattr(policy, "last_expert_action_raw", None) is not None:
+            expert_actions_raw.append(policy.last_expert_action_raw.copy())
+        if getattr(policy, "last_expert_action_clipped", None) is not None:
+            expert_actions_clipped.append(policy.last_expert_action_clipped.copy())
+        if getattr(policy, "last_noise", None) is not None:
+            action_noises.append(policy.last_noise.copy())
+        obs, _reward, terminated, truncated, info = env.step(action)
 
         if info.get("success", 0.0) > 0.0:
             success = True
@@ -208,29 +247,36 @@ def collect_episode(env, policy: MetaWorldPolicy, policy_type: str, task_name: s
         if terminated or truncated:
             break
 
-    if policy_type == "expert" and not success:
-        print(f"  [Warn] Expert failed on {task_name} but saving anyway.", flush=True)
+    if not success and policy_name != "random_walk":
+        print(
+            f"  [Warn] {policy_name} rollout failed on {task_name} but saving anyway.",
+            flush=True,
+        )
 
-    return {
-        "images": np.array(frames, dtype=np.uint8),
-        "robot_xyz": np.array(robot_xyz_list, dtype=np.float32),
-        "proprioception": np.array(proprioception_list, dtype=np.float32),
-        "kinematics_prediction": np.array(kinematics_prediction_list, dtype=np.float32),
+    data_dict = {
+        "pixels": np.array(rgb_frames, dtype=np.uint8),
+        "depth": np.array(depth_frames, dtype=np.float32),
+        "proprio": np.array(proprioception_list, dtype=np.float32),
+        "tactile": np.array(tactile_frames, dtype=np.float32),
         "gripper": np.array(gripper_list, dtype=np.float32),
-        "obj1_xyz": np.array(obj1_xyz_list, dtype=np.float32),
-        "obj1_quat": np.array(obj1_quat_list, dtype=np.float32),
-        "obj2_xyz": np.array(obj2_xyz_list, dtype=np.float32),
-        "obj2_quat": np.array(obj2_quat_list, dtype=np.float32),
         "action": np.array(actions, dtype=np.float32),
-        "success": success,
-        "policy": policy_type,
     }
+    if len(expert_actions_raw) == len(actions):
+        data_dict["expert_action_raw"] = np.array(expert_actions_raw, dtype=np.float32)
+    if len(expert_actions_clipped) == len(actions):
+        data_dict["expert_action_clipped"] = np.array(
+            expert_actions_clipped, dtype=np.float32
+        )
+    if len(action_noises) == len(actions):
+        data_dict["action_noise"] = np.array(action_noises, dtype=np.float32)
+    return data_dict
 
 
 def worker_process(worker_id, env_names, args):
     """
     Worker function to process a subset of environments.
     """
+    h5py = _require_h5py()
     temp_path = Path(args.temp_dir) / f"temp_worker_{worker_id}.hdf5"
     temp_path.parent.mkdir(parents=True, exist_ok=True)
     print(
@@ -248,8 +294,6 @@ def worker_process(worker_id, env_names, args):
                 tasks_by_env[task.env_name] = []
             tasks_by_env[task.env_name].append(task)
 
-    camera_views = ["corner", "corner2", "corner3", "topview"]
-
     with h5py.File(temp_path, "w") as f:
         # We finish one environment completely before loading the assets for the next.
         for i, env_name in enumerate(env_names):
@@ -258,84 +302,99 @@ def worker_process(worker_id, env_names, args):
                 flush=True,
             )
 
+            env_cls = mt50.train_classes[env_name]
+            if get_policy_for_task(env_name) is None:
+                print(
+                    f"[Worker {worker_id}] Skipping {env_name}: no scripted policy available.",
+                    flush=True,
+                )
+                continue
+
+            available_tasks = tasks_by_env.get(env_name, [])
+            if not available_tasks:
+                print(
+                    f"[Worker {worker_id}] Skipping {env_name}: no tasks available.",
+                    flush=True,
+                )
+                continue
+
             # Create the Group ONCE per environment
             task_group = f.create_group(env_name)
             task_group.attrs["task_name"] = env_name
+            task_group.attrs["randomize_every_reset"] = bool(
+                args.randomize_every_reset
+            )
 
-            env_cls = mt50.train_classes[env_name]
-            expert_policy = get_policy_for_task(env_name)
-            available_tasks = tasks_by_env.get(env_name, [])
-
-            # Global counter for this environment (across all cameras)
             episode_global_idx = 0
+            env = env_cls(render_mode="rgb_array", camera_name=RGB_CAMERA_NAME)
+            depth_sensor = DepthCameraSensor(
+                camera_name=DEPTH_CAMERA_NAME,
+                height=DEPTH_IMAGE_HEIGHT,
+                width=DEPTH_IMAGE_WIDTH,
+                normalize=False,
+            )
+            tactile_sensor = TactileDigitSensor(
+                resolution=TACTILE_RESOLUTION,
+                noise_std=0.0,
+                base_texture=False,
+                normalize=False,
+                photometric_render=False,
+            )
 
-            # Iterate Cameras
-            for cam in camera_views:
-                # We must re-init the env to change the camera in standard MetaWorld
-                # (This is safer than dynamic rendering which can be version-dependent)
-                env = env_cls(render_mode="rgb_array", camera_name=cam)
+            episode_policy_schedule = _build_episode_policy_schedule(args.num_episodes)
+            for policy_type in episode_policy_schedule:
+                random_task = random.choice(available_tasks)
+                env.set_task(random_task)
+                _set_randomized_resets(env, args.randomize_every_reset)
 
-                modes = [("random", args.num_episodes_random)]
-                if expert_policy is not None:
-                    modes.append(("expert", args.num_episodes_expert))
+                policy, policy_metadata = _make_policy_for_episode(
+                    env_name=env_name,
+                    args=args,
+                    policy_type=policy_type,
+                )
 
-                for mode, target_count in modes:
-                    collected_count = 0
-                    while collected_count < target_count:
-                        random_task = random.choice(available_tasks)
-                        env.set_task(random_task)
+                data_dict = collect_episode(
+                    env=env,
+                    policy=policy,
+                    task_name=env_name,
+                    depth_sensor=depth_sensor,
+                    tactile_sensor=tactile_sensor,
+                    policy_name=policy_metadata["policy_type"],
+                )
 
-                        if mode == "expert":
-                            policy = NoisyExpertPolicy(
-                                expert_policy, noise_scale=args.expert_noise
-                            )
-                        else:
-                            policy = RandomWalk(
-                                direction_policy=args.random_direction_policy,
-                                step_length_policy=args.random_step_length_policy,
-                            )
+                ep_group = task_group.create_group(f"episode_{episode_global_idx}")
+                ep_group.create_dataset(
+                    "pixels", data=data_dict["pixels"], compression="gzip"
+                )
+                ep_group.create_dataset(
+                    "depth",
+                    data=data_dict["depth"],
+                    compression="gzip",
+                )
+                ep_group.create_dataset(
+                    "proprio", data=data_dict["proprio"]
+                )
+                ep_group.create_dataset(
+                    "tactile",
+                    data=data_dict["tactile"],
+                    compression="gzip",
+                )
+                ep_group.create_dataset("gripper", data=data_dict["gripper"])
+                ep_group.create_dataset("action", data=data_dict["action"])
 
-                        data_dict = collect_episode(env, policy, mode, env_name)
+                ep_group.attrs["policy_type"] = policy_metadata["policy_type"]
+                ep_group.attrs["task_name"] = env_name
+                ep_group.attrs["randomize_every_reset"] = bool(
+                    args.randomize_every_reset
+                )
+                for key, value in policy_metadata.items():
+                    if key == "policy_type":
+                        continue
+                    ep_group.attrs[key] = value
 
-                        # We use a flat structure: episode_0, episode_1, but tag them with the camera name.
-                        ep_group = task_group.create_group(
-                            f"episode_{episode_global_idx}"
-                        )
+                episode_global_idx += 1
 
-                        ep_group.create_dataset(
-                            "images", data=data_dict["images"], compression="gzip"
-                        )
-                        ep_group.create_dataset(
-                            "robot_xyz", data=data_dict["robot_xyz"]
-                        )
-                        ep_group.create_dataset(
-                            "proprioception", data=data_dict["proprioception"]
-                        )
-                        ep_group.create_dataset(
-                            "kinematics_prediction",
-                            data=data_dict["kinematics_prediction"],
-                        )
-                        ep_group.create_dataset("gripper", data=data_dict["gripper"])
-                        ep_group.create_dataset("obj1_xyz", data=data_dict["obj1_xyz"])
-                        ep_group.create_dataset(
-                            "obj1_quat", data=data_dict["obj1_quat"]
-                        )
-                        ep_group.create_dataset("obj2_xyz", data=data_dict["obj2_xyz"])
-                        ep_group.create_dataset(
-                            "obj2_quat", data=data_dict["obj2_quat"]
-                        )
-                        ep_group.create_dataset("action", data=data_dict["action"])
-
-                        ep_group.attrs["success"] = data_dict["success"]
-                        ep_group.attrs["policy_type"] = data_dict["policy"]
-                        ep_group.attrs["task_name"] = env_name
-
-                        ep_group.attrs["camera_name"] = cam
-
-                        collected_count += 1
-                        episode_global_idx += 1
-
-                env.close()
+            env.close()
 
     print(f"[Worker {worker_id}] Finished.", flush=True)
 
@@ -402,6 +461,7 @@ def explore_qpos():
 
 
 def full_data_collection(args):
+    h5py = _require_h5py()
     mt50 = metaworld.MT50()
     all_env_names = list(mt50.train_classes.keys())
     # Divide work
@@ -458,39 +518,81 @@ def main():
         "--cpus", type=int, default=1, help="Number of CPU cores/workers"
     )
     parser.add_argument(
-        "--num_episodes_expert", type=int, default=DEFAULT_EPISODES_EXPERT
+        "--num_episodes",
+        type=int,
+        default=DEFAULT_NUM_EPISODES,
+        help="Total episodes to collect per environment across noisy expert and random walk behaviors",
     )
     parser.add_argument(
-        "--expert_noise",
+        "--expert_noise_min",
         type=float,
-        default=0.1,
-        help="Stddev of Gaussian noise for expert actions",
+        default=DEFAULT_EXPERT_NOISE_MIN,
+        help="Minimum per-episode Gaussian noise scale for expert actions",
     )
     parser.add_argument(
-        "--num_episodes_random", type=int, default=DEFAULT_EPISODES_RANDOM
-    )
-    parser.add_argument(
-        "--random_direction_policy",
-        type=str,
-        default="gravity",
-        help="Random walk policy for random episodes",
-        choices=["uniform", "gaussian", "gravity"],
-    )
-    parser.add_argument(
-        "--random_step_length_policy",
-        type=str,
-        default="levy",
-        help="Step length policy for random walk",
-        choices=["constant", "levy"],
+        "--expert_noise_max",
+        type=float,
+        default=DEFAULT_EXPERT_NOISE_MAX,
+        help="Maximum per-episode Gaussian noise scale for expert actions",
     )
     parser.add_argument("--dataset_path", type=str, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--temp_dir", type=str, default=DEFAULT_TEMP_DIR)
+    parser.add_argument(
+        "--randomize_every_reset",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_RANDOMIZE_EVERY_RESET,
+        help="If enabled, sample a fresh object/goal placement on every reset instead of using the frozen MT50 task layout",
+    )
+    parser.add_argument(
+        "--random_walk_direction_stddev",
+        type=float,
+        default=DEFAULT_RANDOM_WALK_DIRECTION_STDDEV,
+        help="Angular perturbation scale for the random-walk direction policy",
+    )
+    parser.add_argument(
+        "--random_walk_gravity_strength",
+        type=float,
+        default=DEFAULT_RANDOM_WALK_GRAVITY_STRENGTH,
+        help="Soft pull toward the workspace center for the random-walk direction policy",
+    )
+    parser.add_argument(
+        "--random_walk_levy_alpha",
+        type=float,
+        default=DEFAULT_RANDOM_WALK_LEVY_ALPHA,
+        help="Pareto alpha for the random-walk step-length policy",
+    )
+    parser.add_argument(
+        "--random_walk_min_step",
+        type=float,
+        default=DEFAULT_RANDOM_WALK_MIN_STEP,
+        help="Minimum random-walk step magnitude before clipping into MetaWorld action space",
+    )
+    parser.add_argument(
+        "--random_walk_max_step",
+        type=float,
+        default=DEFAULT_RANDOM_WALK_MAX_STEP,
+        help="Maximum random-walk step magnitude before clipping into MetaWorld action space",
+    )
     parser.add_argument(
         "--explore-qpos",
         action="store_true",
         help="Print joint positions during collection",
     )
     args = parser.parse_args()
+    if args.expert_noise_min < 0.0 or args.expert_noise_max < 0.0:
+        parser.error("expert noise bounds must be non-negative")
+    if args.expert_noise_min > args.expert_noise_max:
+        parser.error("expert_noise_min must be less than or equal to expert_noise_max")
+    if args.random_walk_direction_stddev <= 0.0:
+        parser.error("random_walk_direction_stddev must be positive")
+    if args.random_walk_gravity_strength < 0.0:
+        parser.error("random_walk_gravity_strength must be non-negative")
+    if args.random_walk_levy_alpha <= 0.0:
+        parser.error("random_walk_levy_alpha must be positive")
+    if args.random_walk_min_step <= 0.0:
+        parser.error("random_walk_min_step must be positive")
+    if args.random_walk_max_step <= args.random_walk_min_step:
+        parser.error("random_walk_max_step must be greater than random_walk_min_step")
 
     print(f"Initializing Meta-World MT50 (Main Process)...", flush=True)
 

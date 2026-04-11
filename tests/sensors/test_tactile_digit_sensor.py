@@ -316,6 +316,20 @@ class TestTactileDigitSensor:
         assert np.all(obs_space.low == 0.0)
         assert np.all(obs_space.high == 1.0)
 
+    def test_observation_space_raw_pressure(self):
+        """Test observation space for raw pressure-map output mode."""
+        sensor = TactileDigitSensor(
+            resolution=32,
+            normalize=True,
+            photometric_render=False,
+        )
+        obs_space = sensor.get_observation_space()
+
+        assert obs_space.shape == (2 * 32 * 32,)
+        assert obs_space.dtype == np.float32
+        assert np.all(obs_space.low == 0.0)
+        assert np.all(obs_space.high == 1.0)
+
     def test_observation_space_unnormalized(self):
         """Test observation bounds for [0, 255] output mode."""
         sensor = TactileDigitSensor(resolution=16, normalize=False)
@@ -335,6 +349,15 @@ class TestTactileDigitSensor:
         assert metadata["channels"] == 3
         assert metadata["fingers"] == 2
         assert metadata["sigma_px"] == 2.5
+
+    def test_metadata_raw_pressure(self):
+        """Test metadata for raw pressure-map mode."""
+        sensor = TactileDigitSensor(photometric_render=False)
+        metadata = sensor.get_metadata()
+
+        assert metadata["modality"] == "pressure_tactile"
+        assert metadata["channels"] == 1
+        assert metadata["photometric_render"] is False
 
     def test_read_before_reset_raises_error(self):
         """Test that reading before reset raises an informative error."""

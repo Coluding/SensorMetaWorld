@@ -30,6 +30,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+data/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -156,6 +157,7 @@ flake.lock
 .envrc
 
 CLAUDE.md
+.codex
 
 *.mp4
 *.png

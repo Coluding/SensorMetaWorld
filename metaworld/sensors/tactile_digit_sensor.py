@@ -11,10 +11,7 @@ import numpy.typing as npt
 
 from metaworld.sensors.base import SensorBase
 
-try:
-    import mujoco
-except ImportError:  # pragma: no cover - optional dependency at runtime.
-    mujoco = None
+import mujoco
 
 if TYPE_CHECKING:
     from metaworld.sawyer_xyz_env import SawyerXYZEnv
@@ -40,6 +37,7 @@ class TactileDigitSensor(SensorBase):
     _DEFAULT_HALF_EXTENT_U = 0.012
     _DEFAULT_HALF_EXTENT_V = 0.018
     _MIN_HALF_EXTENT = 0.006
+    _PRESSURE_CLIP = 1.5
     _TACTILE_U_AXIS = 0
     _TACTILE_V_AXIS = 2
     _TACTILE_NORMAL_AXIS = 1
@@ -52,6 +50,7 @@ class TactileDigitSensor(SensorBase):
         base_texture: bool = True,
         seed: int | None = None,
         normalize: bool = True,
+        photometric_render: bool = True,
     ) -> None:
         self.resolution = int(resolution)
         self.sigma_px = float(sigma_px)
@@ -59,6 +58,7 @@ class TactileDigitSensor(SensorBase):
         self.base_texture = bool(base_texture)
         self.seed = seed
         self.normalize = bool(normalize)
+        self.photometric_render = bool(photometric_render)
 
         if self.resolution <= 0:
             raise ValueError("resolution must be positive.")
@@ -73,6 +73,8 @@ class TactileDigitSensor(SensorBase):
         self._reading: npt.NDArray[np.float32] | None = None
         self._left_image: npt.NDArray[np.float32] | None = None
         self._right_image: npt.NDArray[np.float32] | None = None
+        self._left_pressure_map: npt.NDArray[np.float32] | None = None
+        self._right_pressure_map: npt.NDArray[np.float32] | None = None
         self._contact_force_tmp = np.zeros(6, dtype=np.float64)
 
         self._base_gel_color = np.array([0.33, 0.38, 0.44], dtype=np.float32)
@@ -89,8 +91,14 @@ class TactileDigitSensor(SensorBase):
         self.validate(env)
         self._left_finger = self._resolve_finger_attachment(env, "left")
         self._right_finger = self._resolve_finger_attachment(env, "right")
-        self._left_image = self._base_image.copy()
-        self._right_image = self._base_image.copy()
+        self._left_pressure_map = np.zeros((self.resolution, self.resolution), dtype=np.float32)
+        self._right_pressure_map = np.zeros((self.resolution, self.resolution), dtype=np.float32)
+        if self.photometric_render:
+            self._left_image = self._base_image.copy()
+            self._right_image = self._base_image.copy()
+        else:
+            self._left_image = self._left_pressure_map.copy()
+            self._right_image = self._right_pressure_map.copy()
         self._reading = self._flatten_images(self._left_image, self._right_image)
 
     def update(self, env: SawyerXYZEnv) -> None:
@@ -141,8 +149,14 @@ class TactileDigitSensor(SensorBase):
                     pressure_map=right_pressure,
                 )
 
-        self._left_image = self._render_tactile_image(left_pressure)
-        self._right_image = self._render_tactile_image(right_pressure)
+        self._left_pressure_map = left_pressure.copy()
+        self._right_pressure_map = right_pressure.copy()
+        if self.photometric_render:
+            self._left_image = self._render_tactile_image(left_pressure)
+            self._right_image = self._render_tactile_image(right_pressure)
+        else:
+            self._left_image = self._format_pressure_map(left_pressure)
+            self._right_image = self._format_pressure_map(right_pressure)
         self._reading = self._flatten_images(self._left_image, self._right_image)
 
     def read(self) -> npt.NDArray[np.float32]:
@@ -155,12 +169,17 @@ class TactileDigitSensor(SensorBase):
         return self._reading
 
     def get_observation_space(self) -> spaces.Space:
-        """Return observation space for two flattened RGB tactile images."""
-        high = 1.0 if self.normalize else 255.0
+        """Return observation space for the configured tactile output mode."""
+        if self.photometric_render:
+            high = 1.0 if self.normalize else 255.0
+            shape = (2 * self.resolution * self.resolution * 3,)
+        else:
+            high = 1.0 if self.normalize else self._PRESSURE_CLIP
+            shape = (2 * self.resolution * self.resolution,)
         return spaces.Box(
             low=0.0,
             high=high,
-            shape=(2 * self.resolution * self.resolution * 3,),
+            shape=shape,
             dtype=np.float32,
         )
 
@@ -168,12 +187,13 @@ class TactileDigitSensor(SensorBase):
         """Return metadata describing this tactile sensor."""
         return {
             "type": "tactile",
-            "modality": "vision_tactile",
+            "modality": "vision_tactile" if self.photometric_render else "pressure_tactile",
             "resolution": self.resolution,
-            "channels": 3,
+            "channels": 3 if self.photometric_render else 1,
             "fingers": 2,
             "normalize": self.normalize,
             "sigma_px": self.sigma_px,
+            "photometric_render": self.photometric_render,
         }
 
     def validate(self, env: SawyerXYZEnv) -> bool:
@@ -355,15 +375,11 @@ class TactileDigitSensor(SensorBase):
         penetration_term = 1.0 - np.exp(-penetration / 0.0008)
 
         force_term = 0.0
-        if mujoco is not None:
-            self._contact_force_tmp.fill(0.0)
-            try:
-                mujoco.mj_contactForce(model, data, contact_index, self._contact_force_tmp)
-            except Exception:  # pragma: no cover - depends on runtime mujoco bindings.
-                force_term = 0.0
-            else:
-                normal_force = abs(float(self._contact_force_tmp[0]))
-                force_term = 1.0 - np.exp(-normal_force / 2.5)
+        self._contact_force_tmp.fill(0.0)
+        try:
+            mujoco.mj_contactForce(model, data, contact_index, self._contact_force_tmp)
+        except Exception:  # pragma: no cover - depends on runtime mujoco bindings.
+            force_term = 0.0
 
         return float(
             np.clip(0.75 * penetration_term + 0.55 * force_term, 0.0, 1.35)
@@ -373,7 +389,7 @@ class TactileDigitSensor(SensorBase):
         self, pressure_map: npt.NDArray[np.float32]
     ) -> npt.NDArray[np.float32]:
         """Convert a pressure map into a lightweight RGB gel image."""
-        pressure = np.clip(pressure_map, 0.0, 1.5).astype(np.float32)
+        pressure = np.clip(pressure_map, 0.0, self._PRESSURE_CLIP).astype(np.float32)
         pressure_visual = np.clip(1.5 * pressure, 0.0, 2.0).astype(np.float32)
 
         grad_y, grad_x = np.gradient(pressure_visual)
@@ -402,6 +418,15 @@ class TactileDigitSensor(SensorBase):
             image = image * np.float32(255.0)
         return image.astype(np.float32)
 
+    def _format_pressure_map(
+        self, pressure_map: npt.NDArray[np.float32]
+    ) -> npt.NDArray[np.float32]:
+        """Clip and optionally normalize a raw pressure map."""
+        pressure = np.clip(pressure_map, 0.0, self._PRESSURE_CLIP).astype(np.float32)
+        if self.normalize:
+            pressure = pressure / np.float32(self._PRESSURE_CLIP)
+        return pressure.astype(np.float32)
+
     def _get_attachment_frame(
         self,
         data: Any,
@@ -420,10 +445,32 @@ class TactileDigitSensor(SensorBase):
         left_image: npt.NDArray[np.float32],
         right_image: npt.NDArray[np.float32],
     ) -> npt.NDArray[np.float32]:
-        """Flatten both RGB images in C-order and concatenate them."""
+        """Flatten both per-finger outputs in C-order and concatenate them."""
         return np.concatenate(
             (left_image.reshape(-1, order="C"), right_image.reshape(-1, order="C"))
         ).astype(np.float32)
+
+    def get_finger_images(
+        self,
+    ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
+        """Return the current per-finger tactile outputs.
+
+        Returns:
+            `(left, right)` where each element is:
+            - `(resolution, resolution, 3)` in photometric mode
+            - `(resolution, resolution)` in raw-pressure mode
+        """
+        if self._left_image is None or self._right_image is None:
+            raise RuntimeError("No tactile images available. Call reset() first.")
+        return self._left_image.copy(), self._right_image.copy()
+
+    def get_pressure_maps(
+        self,
+    ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
+        """Return the latest unclipped per-finger pressure maps."""
+        if self._left_pressure_map is None or self._right_pressure_map is None:
+            raise RuntimeError("No pressure maps available. Call reset() first.")
+        return self._left_pressure_map.copy(), self._right_pressure_map.copy()
 
     def _coord_to_pixel(self, value: float, half_extent: float) -> float:
         """Map local finger-plane coordinates to image pixel coordinates."""

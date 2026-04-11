@@ -281,22 +281,46 @@ class RandomWalk(MetaWorldPolicy):
 
         # Construct 4D Action
         # [dx, dy, dz, gripper_control]
-        gripper = np.random.uniform(-1.0, 1.0)
-        return np.array([dx, dy, dz, gripper], dtype=np.float32)
+        gripper = self.rng.uniform(-1.0, 1.0)
+        action = np.array([dx, dy, dz, gripper], dtype=np.float32)
+        return np.clip(action, -1.0, 1.0)
 
 
 class NoisyExpertPolicy(MetaWorldPolicy):
     def __init__(self, expert_policy, noise_scale=0.1):
         self.expert_policy = expert_policy
-        # Standard deviation of the noise
+        # Standard deviation of the noise in the clipped action space.
         self.noise_scale = noise_scale
+        self.last_expert_action_raw = None
+        self.last_expert_action_clipped = None
+        self.last_noise = None
+        self.last_noisy_action = None
+
+    def set_reference_position(self, reference_position):
+        if hasattr(self.expert_policy, "set_reference_position"):
+            self.expert_policy.set_reference_position(reference_position)
 
     def get_action(self, obs):
-        # Get the perfect expert action
-        expert_action = self.expert_policy.get_action(obs)
+        # Scripted Meta-World experts often emit values far outside [-1, 1].
+        # The environment clips internally, so adding noise before clipping can
+        # get washed out entirely by saturation. We therefore inject noise in
+        # the action space the environment will actually receive.
+        expert_action_raw = np.asarray(
+            self.expert_policy.get_action(obs), dtype=np.float32
+        )
+        expert_action = np.clip(expert_action_raw, -1.0, 1.0)
 
         # Generate Gaussian noise
         # We are also adding noise to the gripper (last dim)
-        noise = np.random.normal(0, self.noise_scale, size=expert_action.shape)
+        noise = np.random.normal(0, self.noise_scale, size=expert_action.shape).astype(
+            np.float32
+        )
 
-        return expert_action + noise
+        noisy_action = expert_action + noise
+        noisy_action = np.clip(noisy_action, -1.0, 1.0).astype(np.float32)
+
+        self.last_expert_action_raw = expert_action_raw.copy()
+        self.last_expert_action_clipped = expert_action.copy()
+        self.last_noise = noise.copy()
+        self.last_noisy_action = noisy_action.copy()
+        return noisy_action
