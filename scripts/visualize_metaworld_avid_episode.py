@@ -35,6 +35,7 @@ from collect_metaworld_avid import (
     get_policy_for_task,
 )
 from metaworld_policies import NoisyExpertPolicy
+from metaworld.sensors.force_torque_sensor import ForceTorqueSensor
 from metaworld.sensors.tactile_digit_sensor import TactileDigitSensor
 from metaworld.sensors.visual import DepthCameraSensor
 
@@ -217,6 +218,7 @@ def _make_overview_frame(
     frame_index: int,
     total_frames: int,
     env_name: str,
+    force_torque: np.ndarray | None = None,
 ) -> np.ndarray:
     rgb_panel = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
     depth_panel = _colorize_depth(depth_frame, *depth_bounds)
@@ -269,6 +271,32 @@ def _make_overview_frame(
         1,
         cv2.LINE_AA,
     )
+
+    if force_torque is not None and force_torque.size == 6:
+        fx, fy, fz, tx, ty, tz = force_torque.tolist()
+        line1 = f"F [N]: {fx:+.2f} {fy:+.2f} {fz:+.2f}"
+        line2 = f"T [N*m]: {tx:+.2f} {ty:+.2f} {tz:+.2f}"
+        base_y = frame.shape[0] - 36
+        cv2.putText(
+            frame,
+            line1,
+            (FRAME_MARGIN, base_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (35, 35, 35),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            line2,
+            (FRAME_MARGIN, base_y + 16),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (35, 35, 35),
+            1,
+            cv2.LINE_AA,
+        )
     return frame
 
 
@@ -279,9 +307,10 @@ def save_overview_video(
     fps: int,
     codec: str,
 ) -> None:
-    rgb_frames = np.asarray(episode["image"], dtype=np.uint8)
-    depth_frames = np.asarray(episode["depth_image"], dtype=np.float32)
-    tactile_frames = np.asarray(episode["tactile_image"], dtype=np.float32)
+    rgb_frames = np.asarray(episode["pixels"], dtype=np.uint8)
+    depth_frames = np.asarray(episode["depth"], dtype=np.float32)
+    tactile_frames = np.asarray(episode["tactile"], dtype=np.float32)
+    force_torque = np.asarray(episode.get("force_torque", []), dtype=np.float32)
 
     depth_bounds = _compute_depth_bounds(depth_frames)
     example_frame = _make_overview_frame(
@@ -292,6 +321,7 @@ def save_overview_video(
         frame_index=0,
         total_frames=len(rgb_frames),
         env_name=env_name,
+        force_torque=force_torque[0] if force_torque.size else None,
     )
     writer = _open_video_writer(
         output_path=output_path,
@@ -312,6 +342,7 @@ def save_overview_video(
                     frame_index=frame_index,
                     total_frames=len(rgb_frames),
                     env_name=env_name,
+                    force_torque=force_torque[frame_index] if force_torque.size else None,
                 )
             )
     finally:
@@ -319,7 +350,7 @@ def save_overview_video(
 
 
 def save_proprioception_csv(episode: dict[str, np.ndarray], output_path: Path) -> None:
-    proprioception = np.asarray(episode["proprioception"], dtype=np.float32)
+    proprioception = np.asarray(episode["proprio"], dtype=np.float32)
     header = ["step"] + [f"qpos_{idx}" for idx in range(proprioception.shape[1])]
 
     with output_path.open("w", newline="", encoding="utf-8") as csv_file:
@@ -330,7 +361,7 @@ def save_proprioception_csv(episode: dict[str, np.ndarray], output_path: Path) -
 
 
 def save_rgb_stats_csv(episode: dict[str, np.ndarray], output_path: Path) -> None:
-    rgb_frames = np.asarray(episode["image"], dtype=np.uint8)
+    rgb_frames = np.asarray(episode["pixels"], dtype=np.uint8)
     header = [
         "frame",
         "max",
@@ -425,6 +456,18 @@ def save_action_diagnostics_csv(
             )
 
 
+def save_force_torque_csv(episode: dict[str, np.ndarray], output_path: Path) -> None:
+    wrench = np.asarray(episode.get("force_torque", []), dtype=np.float32)
+    if wrench.size == 0:
+        return
+    header = ["step", "fx", "fy", "fz", "tx", "ty", "tz"]
+    with output_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(header)
+        for step_index, row in enumerate(wrench):
+            writer.writerow([step_index, *row.tolist()])
+
+
 def select_task(
     available_tasks: list,
     rng: random.Random,
@@ -493,6 +536,12 @@ def collect_single_episode(args: argparse.Namespace) -> tuple[dict[str, np.ndarr
         normalize=False,
         photometric_render=False,
     )
+    force_torque_sensor = ForceTorqueSensor(
+        geom_names=None,
+        origin_site="endEffector",
+        output_frame="world",
+        lowpass_alpha=0.2,
+    )
 
     try:
         env.set_task(selected_task)
@@ -502,6 +551,7 @@ def collect_single_episode(args: argparse.Namespace) -> tuple[dict[str, np.ndarr
             task_name=args.env_name,
             depth_sensor=depth_sensor,
             tactile_sensor=tactile_sensor,
+            force_torque_sensor=force_torque_sensor,
             max_steps=args.max_steps,
             reset_seed=args.seed,
         )
@@ -514,7 +564,7 @@ def collect_single_episode(args: argparse.Namespace) -> tuple[dict[str, np.ndarr
         "task_index": selected_task_index,
         "num_available_tasks": len(available_tasks),
         "noise_scale": float(noise_scale),
-        "num_steps": int(len(episode["image"])),
+        "num_steps": int(len(episode["pixels"])),
         "rgb_camera_name": RGB_CAMERA_NAME,
         "depth_camera_name": DEPTH_CAMERA_NAME,
     }
@@ -532,6 +582,7 @@ def main() -> None:
     proprio_path = output_dir / "proprioception.csv"
     rgb_stats_path = output_dir / "rgb_stats.csv"
     action_diagnostics_path = output_dir / "action_diagnostics.csv"
+    force_torque_path = output_dir / "force_torque.csv"
     metadata_path = output_dir / "metadata.json"
 
     save_overview_video(
@@ -544,6 +595,7 @@ def main() -> None:
     save_proprioception_csv(episode, proprio_path)
     save_rgb_stats_csv(episode, rgb_stats_path)
     save_action_diagnostics_csv(episode, action_diagnostics_path)
+    save_force_torque_csv(episode, force_torque_path)
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     print(f"Saved overview video to {video_path}")
@@ -551,6 +603,8 @@ def main() -> None:
     print(f"Saved RGB stats CSV to {rgb_stats_path}")
     if action_diagnostics_path.exists():
         print(f"Saved action diagnostics CSV to {action_diagnostics_path}")
+    if force_torque_path.exists():
+        print(f"Saved force/torque CSV to {force_torque_path}")
     print(f"Saved metadata to {metadata_path}")
 
 

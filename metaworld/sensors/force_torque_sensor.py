@@ -35,6 +35,7 @@ class ForceTorqueSensor(SensorBase):
         # that if the site rotates, the reported force/torque axes rotate with it. If "world", the wrench is expressed in the world frame.
         output_frame: Literal["world", "sensor"] = "world",
         invert_sign: bool = False,
+        lowpass_alpha: float | None = None,
     ) -> None:
         """Initialize the force/torque sensor.
 
@@ -49,6 +50,9 @@ class ForceTorqueSensor(SensorBase):
         self.origin_site = origin_site
         self.output_frame = output_frame
         self.invert_sign = invert_sign
+        if lowpass_alpha is not None and not (0.0 < lowpass_alpha <= 1.0):
+            raise ValueError("lowpass_alpha must be in (0, 1] when provided.")
+        self.lowpass_alpha = lowpass_alpha
 
         self._geom_ids: set[int] = set()
         self._site_id: int | None = None
@@ -56,6 +60,7 @@ class ForceTorqueSensor(SensorBase):
         self._force_sensor_adr: int | None = None
         self._torque_sensor_adr: int | None = None
         self._wrench: npt.NDArray[np.float64] | None = None
+        self._wrench_filtered: npt.NDArray[np.float64] | None = None
         self._contact_wrench_tmp = np.zeros(6, dtype=np.float64)
 
     @property
@@ -142,6 +147,7 @@ class ForceTorqueSensor(SensorBase):
             env
         )
         self._wrench = np.zeros(6, dtype=np.float64)
+        self._wrench_filtered = None
 
     def update(self, env: MujocoEnv) -> None:
         """Update wrench from active contacts."""
@@ -254,6 +260,15 @@ class ForceTorqueSensor(SensorBase):
             self._wrench[:3] = rot_world_to_sensor @ self._wrench[:3]
             self._wrench[3:] = rot_world_to_sensor @ self._wrench[3:]
 
+        if self.lowpass_alpha is not None:
+            if self._wrench_filtered is None:
+                self._wrench_filtered = self._wrench.copy()
+            else:
+                alpha = self.lowpass_alpha
+                self._wrench_filtered = (
+                    alpha * self._wrench + (1.0 - alpha) * self._wrench_filtered
+                )
+
     def read(self) -> npt.NDArray[np.float64]:
         """Return current wrench [Fx, Fy, Fz, Tx, Ty, Tz]."""
         if self._wrench is None:
@@ -261,6 +276,8 @@ class ForceTorqueSensor(SensorBase):
                 f"Sensor '{self.name}' read() called before reset(). "
                 "Call env.reset() first."
             )
+        if self._wrench_filtered is not None:
+            return self._wrench_filtered.copy()
         return self._wrench.copy()
 
     def get_observation_space(self) -> spaces.Space:

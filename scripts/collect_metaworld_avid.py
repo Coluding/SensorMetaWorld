@@ -12,6 +12,7 @@ from metaworld_policies import (
     NoisyExpertPolicy,
     RandomWalk,
 )
+from metaworld.sensors.force_torque_sensor import ForceTorqueSensor
 from metaworld.sensors.tactile_digit_sensor import TactileDigitSensor
 from metaworld.sensors.visual import DepthCameraSensor
 
@@ -155,6 +156,49 @@ def _initialize_policy_reference_position(
     policy.set_reference_position(reference_position)
 
 
+def _get_object_xyzs(env) -> tuple[np.ndarray, np.ndarray]:
+    """Return (object_1_xyz, object_2_xyz) from the env if available."""
+    obj1 = np.full(3, np.nan, dtype=np.float32)
+    obj2 = np.full(3, np.nan, dtype=np.float32)
+    try:
+        obj_pos = np.asarray(env._get_pos_objects(), dtype=np.float32).reshape(-1)
+    except Exception:
+        return obj1, obj2
+
+    if obj_pos.size < 3:
+        return obj1, obj2
+
+    count = obj_pos.size // 3
+    obj_pos = obj_pos[: count * 3]
+    objs = np.split(obj_pos, count)
+    obj1 = objs[0].copy()
+    if count > 1:
+        obj2 = objs[1].copy()
+    return obj1, obj2
+
+
+def _gripper_touching_any(env) -> bool:
+    """Check if either gripper pad is touching any non-gripper geometry."""
+    try:
+        data = env.unwrapped.data
+        leftpad_geom_id = data.geom("leftpad_geom").id
+        rightpad_geom_id = data.geom("rightpad_geom").id
+        pad_ids = {leftpad_geom_id, rightpad_geom_id}
+        for contact in data.contact:
+            if contact.geom1 in pad_ids or contact.geom2 in pad_ids:
+                other = contact.geom2 if contact.geom1 in pad_ids else contact.geom1
+                if other in pad_ids:
+                    continue
+                if data.efc_force[contact.efc_address] > 0:
+                    return True
+        return False
+    except Exception:
+        try:
+            return bool(env.touching_main_object)
+        except Exception:
+            return False
+
+
 def _render_rgb_frame(env) -> np.ndarray:
     """Render one RGB frame from the environment's configured camera."""
     frame = None
@@ -193,6 +237,7 @@ def collect_episode(
     task_name: str,
     depth_sensor: DepthCameraSensor,
     tactile_sensor: TactileDigitSensor,
+    force_torque_sensor: ForceTorqueSensor,
     max_steps: int = MAX_STEPS,
     reset_seed: int | None = None,
     policy_name: str = "policy",
@@ -204,6 +249,7 @@ def collect_episode(
     obs, _ = env.reset(seed=reset_seed)
     depth_sensor.reset(env)
     tactile_sensor.reset(env)
+    force_torque_sensor.reset(env)
     _initialize_policy_reference_position(env, policy, obs)
 
     rgb_frames = []
@@ -211,6 +257,11 @@ def collect_episode(
     tactile_frames = []
     proprioception_list = []
     gripper_list = []
+    ee_xyz_list = []
+    object_1_xyz_list = []
+    object_2_xyz_list = []
+    bool_contact_list = []
+    force_torque_list = []
     actions = []
     expert_actions_raw = []
     expert_actions_clipped = []
@@ -230,6 +281,15 @@ def collect_episode(
 
         proprioception_list.append(env.data.qpos[:7].copy())
         gripper_list.append(np.float32(obs[3]))
+        ee_xyz_list.append(np.asarray(env.get_endeff_pos(), dtype=np.float32).copy())
+        obj1, obj2 = _get_object_xyzs(env)
+        object_1_xyz_list.append(obj1)
+        object_2_xyz_list.append(obj2)
+        bool_contact_list.append(_gripper_touching_any(env))
+        force_torque_sensor.update(env)
+        force_torque_list.append(
+            np.asarray(force_torque_sensor.read(), dtype=np.float32)
+        )
 
         action = np.asarray(policy.get_action(obs), dtype=np.float32)
         actions.append(action)
@@ -258,7 +318,12 @@ def collect_episode(
         "depth": np.array(depth_frames, dtype=np.float32),
         "proprio": np.array(proprioception_list, dtype=np.float32),
         "tactile": np.array(tactile_frames, dtype=np.float32),
+        "force_torque": np.array(force_torque_list, dtype=np.float32),
         "gripper": np.array(gripper_list, dtype=np.float32),
+        "ee_xyz": np.array(ee_xyz_list, dtype=np.float32),
+        "object_1_xyz": np.array(object_1_xyz_list, dtype=np.float32),
+        "object_2_xyz": np.array(object_2_xyz_list, dtype=np.float32),
+        "bool_contact": np.array(bool_contact_list, dtype=np.bool_),
         "action": np.array(actions, dtype=np.float32),
     }
     if len(expert_actions_raw) == len(actions):
@@ -340,6 +405,12 @@ def worker_process(worker_id, env_names, args):
                 normalize=False,
                 photometric_render=False,
             )
+            force_torque_sensor = ForceTorqueSensor(
+                geom_names=None,
+                origin_site="endEffector",
+                output_frame="world",
+                lowpass_alpha=0.2,
+            )
 
             episode_policy_schedule = _build_episode_policy_schedule(args.num_episodes)
             for policy_type in episode_policy_schedule:
@@ -359,6 +430,7 @@ def worker_process(worker_id, env_names, args):
                     task_name=env_name,
                     depth_sensor=depth_sensor,
                     tactile_sensor=tactile_sensor,
+                    force_torque_sensor=force_torque_sensor,
                     policy_name=policy_metadata["policy_type"],
                 )
 
@@ -380,6 +452,11 @@ def worker_process(worker_id, env_names, args):
                     compression="gzip",
                 )
                 ep_group.create_dataset("gripper", data=data_dict["gripper"])
+                ep_group.create_dataset("ee_xyz", data=data_dict["ee_xyz"])
+                ep_group.create_dataset("object_1_xyz", data=data_dict["object_1_xyz"])
+                ep_group.create_dataset("object_2_xyz", data=data_dict["object_2_xyz"])
+                ep_group.create_dataset("bool_contact", data=data_dict["bool_contact"])
+                ep_group.create_dataset("force_torque", data=data_dict["force_torque"])
                 ep_group.create_dataset("action", data=data_dict["action"])
 
                 ep_group.attrs["policy_type"] = policy_metadata["policy_type"]
