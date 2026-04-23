@@ -9,13 +9,31 @@ import mujoco
 import numpy as np
 import numpy.typing as npt
 from gymnasium import spaces
-import cv2 as cv
 
 
 from metaworld.sensors.base import SensorBase
 
 if TYPE_CHECKING:
     from metaworld.sawyer_xyz_env import SawyerXYZEnv
+
+try:
+    import cv2 as cv
+except ImportError:
+    cv = None
+
+
+def _resize_array(image: npt.NDArray, width: int, height: int) -> npt.NDArray:
+    """Resize with OpenCV when available, otherwise nearest-neighbor NumPy."""
+    if cv is not None:
+        return cv.resize(image, (width, height))
+    if image.shape[0] == height and image.shape[1] == width:
+        return image
+
+    y_idx = np.linspace(0, image.shape[0] - 1, height).astype(np.int64)
+    x_idx = np.linspace(0, image.shape[1] - 1, width).astype(np.int64)
+    if image.ndim == 2:
+        return image[y_idx][:, x_idx]
+    return image[y_idx][:, x_idx, ...]
 
 
 class DepthCameraSensor(SensorBase):
@@ -157,8 +175,7 @@ class DepthCameraSensor(SensorBase):
                 self._warned_render_failure = True
             _depth_img = np.zeros((self.height, self.width), dtype=np.float32)
 
-        # OpenCV expects resize dimensions as (width, height).
-        _depth_img = cv.resize(_depth_img, (self.width, self.height))
+        _depth_img = _resize_array(_depth_img, width=self.width, height=self.height)
         _depth_img = np.flipud(_depth_img)
 
         if self.normalize:
