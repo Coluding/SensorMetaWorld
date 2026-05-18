@@ -19,7 +19,7 @@ from metaworld.sensors.visual import DepthCameraSensor
 from pathlib import Path
 
 # Defaults
-DEFAULT_DATASET_PATH = "data/metaworld/metaworld_corner2.hdf5"
+DEFAULT_DATASET_PATH = "data/metaworld/metaworld_eval.hdf5"
 DEFAULT_TEMP_DIR = "data/metaworld/temp/"
 DEFAULT_NUM_EPISODES = 1
 DEFAULT_EXPERT_NOISE_MIN = 0.1
@@ -72,10 +72,7 @@ def _build_episode_policy_schedule(num_episodes: int) -> list[str]:
     """Return a shuffled 50/50-ish split of noisy expert and random walk."""
     num_noisy_expert = (num_episodes + 1) // 2
     num_random_walk = num_episodes // 2
-    schedule = (
-        ["noisy_expert"] * num_noisy_expert
-        + ["random_walk"] * num_random_walk
-    )
+    schedule = ["noisy_expert"] * num_noisy_expert + ["random_walk"] * num_random_walk
     random.shuffle(schedule)
     return schedule
 
@@ -386,9 +383,7 @@ def worker_process(worker_id, env_names, args):
             # Create the Group ONCE per environment
             task_group = f.create_group(env_name)
             task_group.attrs["task_name"] = env_name
-            task_group.attrs["randomize_every_reset"] = bool(
-                args.randomize_every_reset
-            )
+            task_group.attrs["randomize_every_reset"] = bool(args.randomize_every_reset)
 
             episode_global_idx = 0
             env = env_cls(render_mode="rgb_array", camera_name=RGB_CAMERA_NAME)
@@ -443,9 +438,7 @@ def worker_process(worker_id, env_names, args):
                     data=data_dict["depth"],
                     compression="gzip",
                 )
-                ep_group.create_dataset(
-                    "proprio", data=data_dict["proprio"]
-                )
+                ep_group.create_dataset("proprio", data=data_dict["proprio"])
                 ep_group.create_dataset(
                     "tactile",
                     data=data_dict["tactile"],
