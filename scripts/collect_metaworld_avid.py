@@ -19,7 +19,7 @@ from metaworld.sensors.visual import DepthCameraSensor
 from pathlib import Path
 
 # Defaults
-DEFAULT_DATASET_PATH = "data/metaworld/metaworld_eval.hdf5"
+DEFAULT_DATASET_PATH = "data/metaworld/metaworld_corner2.hdf5"
 DEFAULT_TEMP_DIR = "data/metaworld/temp/"
 DEFAULT_NUM_EPISODES = 1
 DEFAULT_EXPERT_NOISE_MIN = 0.1
@@ -68,11 +68,27 @@ def _set_randomized_resets(env, enabled: bool) -> None:
     env._freeze_rand_vec = not enabled
 
 
-def _build_episode_policy_schedule(num_episodes: int) -> list[str]:
-    """Return a shuffled 50/50-ish split of noisy expert and random walk."""
+def _build_episode_policy_schedule(
+    num_episodes: int,
+    policy_mode: str = "mixed",
+) -> list[str]:
+    """Build the episode-level policy schedule for one environment."""
+    if policy_mode == "expert_only":
+        return ["noisy_expert"] * num_episodes
+
+    if policy_mode == "random_walk_only":
+        return ["random_walk"] * num_episodes
+
+    if policy_mode != "mixed":
+        raise ValueError(f"Unknown policy_mode: {policy_mode}")
+
+    # Default mixed schedule: roughly 50/50 noisy expert and random walk.
     num_noisy_expert = (num_episodes + 1) // 2
     num_random_walk = num_episodes // 2
-    schedule = ["noisy_expert"] * num_noisy_expert + ["random_walk"] * num_random_walk
+    schedule = (
+        ["noisy_expert"] * num_noisy_expert
+        + ["random_walk"] * num_random_walk
+    )
     random.shuffle(schedule)
     return schedule
 
@@ -383,7 +399,9 @@ def worker_process(worker_id, env_names, args):
             # Create the Group ONCE per environment
             task_group = f.create_group(env_name)
             task_group.attrs["task_name"] = env_name
-            task_group.attrs["randomize_every_reset"] = bool(args.randomize_every_reset)
+            task_group.attrs["randomize_every_reset"] = bool(
+                args.randomize_every_reset
+            )
 
             episode_global_idx = 0
             env = env_cls(render_mode="rgb_array", camera_name=RGB_CAMERA_NAME)
@@ -407,7 +425,10 @@ def worker_process(worker_id, env_names, args):
                 lowpass_alpha=0.2,
             )
 
-            episode_policy_schedule = _build_episode_policy_schedule(args.num_episodes)
+            episode_policy_schedule = _build_episode_policy_schedule(
+                args.num_episodes,
+                policy_mode=args.policy_mode,
+            )
             for policy_type in episode_policy_schedule:
                 random_task = random.choice(available_tasks)
                 env.set_task(random_task)
@@ -438,7 +459,9 @@ def worker_process(worker_id, env_names, args):
                     data=data_dict["depth"],
                     compression="gzip",
                 )
-                ep_group.create_dataset("proprio", data=data_dict["proprio"])
+                ep_group.create_dataset(
+                    "proprio", data=data_dict["proprio"]
+                )
                 ep_group.create_dataset(
                     "tactile",
                     data=data_dict["tactile"],
@@ -592,6 +615,13 @@ def main():
         type=int,
         default=DEFAULT_NUM_EPISODES,
         help="Total episodes to collect per environment across noisy expert and random walk behaviors",
+    )
+    parser.add_argument(
+        "--policy_mode",
+        type=str,
+        choices=("mixed", "expert_only", "random_walk_only"),
+        default="mixed",
+        help="Choose whether episodes are split between noisy expert and random walk, or collected from only one policy family.",
     )
     parser.add_argument(
         "--expert_noise_min",
