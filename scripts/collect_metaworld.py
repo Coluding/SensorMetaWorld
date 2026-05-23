@@ -30,6 +30,7 @@ DEFAULT_RANDOM_WALK_GRAVITY_STRENGTH = 0.01
 DEFAULT_RANDOM_WALK_LEVY_ALPHA = 1.35
 DEFAULT_RANDOM_WALK_MIN_STEP = 1.0
 DEFAULT_RANDOM_WALK_MAX_STEP = 4.0
+DEFAULT_RANDOMIZE_HAND_START = True
 MAX_STEPS = 200
 RGB_CAMERA_NAME = "corner2"
 DEPTH_CAMERA_NAME = RGB_CAMERA_NAME
@@ -63,13 +64,68 @@ def get_policy_for_task(task_name):
     return policy_cls() if policy_cls is not None else None
 
 
+def _parse_task_names(raw_tasks: list[str] | None) -> list[str] | None:
+    if raw_tasks is None:
+        return None
+
+    task_names = []
+    for item in raw_tasks:
+        for task_name in item.split(","):
+            task_name = task_name.strip()
+            if task_name and task_name not in task_names:
+                task_names.append(task_name)
+    return task_names
+
+
 def _set_randomized_resets(env, enabled: bool) -> None:
     """Allow fresh object/goal placement samples on every reset."""
     env._freeze_rand_vec = not enabled
 
 
-def _build_episode_policy_schedule(num_episodes: int) -> list[str]:
-    """Return a shuffled 50/50-ish split of noisy expert and random walk."""
+def _sample_hand_start_position(env) -> np.ndarray:
+    """Sample a reachable initial end-effector position from the task workspace."""
+    hand_low = getattr(env, "hand_low", None)
+    hand_high = getattr(env, "hand_high", None)
+    if hand_low is None or hand_high is None:
+        raise ValueError(
+            "Cannot randomize hand start because this environment does not expose "
+            "hand_low/hand_high workspace bounds."
+        )
+
+    hand_low = np.asarray(hand_low, dtype=np.float32)
+    hand_high = np.asarray(hand_high, dtype=np.float32)
+    if hand_low.shape != (3,) or hand_high.shape != (3,):
+        raise ValueError(
+            "Expected hand_low/hand_high to be 3D workspace bounds, got "
+            f"{hand_low.shape} and {hand_high.shape}."
+        )
+
+    return np.random.default_rng().uniform(hand_low, hand_high).astype(np.float32)
+
+
+def _set_hand_start_position(env, hand_start_pos: np.ndarray) -> None:
+    """Set the next reset's Sawyer hand start position."""
+    hand_start_pos = np.asarray(hand_start_pos, dtype=np.float32)
+    env.hand_init_pos = hand_start_pos
+    if hasattr(env, "init_config") and "hand_init_pos" in env.init_config:
+        env.init_config["hand_init_pos"] = hand_start_pos
+
+
+def _build_episode_policy_schedule(
+    num_episodes: int,
+    policy_mode: str = "mixed",
+) -> list[str]:
+    """Build the episode-level policy schedule for one environment."""
+    if policy_mode == "expert_only":
+        return ["noisy_expert"] * num_episodes
+
+    if policy_mode == "random_walk_only":
+        return ["random_walk"] * num_episodes
+
+    if policy_mode != "mixed":
+        raise ValueError(f"Unknown policy_mode: {policy_mode}")
+
+    # Default mixed schedule: roughly 50/50 noisy expert and random walk.
     num_noisy_expert = (num_episodes + 1) // 2
     num_random_walk = num_episodes // 2
     schedule = (
@@ -241,16 +297,24 @@ def collect_episode(
     max_steps: int = MAX_STEPS,
     reset_seed: int | None = None,
     policy_name: str = "policy",
+    randomize_hand_start: bool = DEFAULT_RANDOMIZE_HAND_START,
 ):
     """
     Runs one episode and returns a DICTIONARY.
     Always returns data, even if expert fails.
     """
-    obs, _ = env.reset(seed=reset_seed)
+    if randomize_hand_start:
+        hand_start_pos = _sample_hand_start_position(env)
+        _set_hand_start_position(env, hand_start_pos)
+    else:
+        hand_start_pos = np.asarray(env.hand_init_pos, dtype=np.float32).copy()
+
+    obs, info = env.reset(seed=reset_seed)
     depth_sensor.reset(env)
     tactile_sensor.reset(env)
     force_torque_sensor.reset(env)
     _initialize_policy_reference_position(env, policy, obs)
+    current_info = dict(info or {})
 
     rgb_frames = []
     depth_frames = []
@@ -261,6 +325,7 @@ def collect_episode(
     object_1_xyz_list = []
     object_2_xyz_list = []
     bool_contact_list = []
+    success_list = []
     force_torque_list = []
     actions = []
     expert_actions_raw = []
@@ -286,6 +351,9 @@ def collect_episode(
         object_1_xyz_list.append(obj1)
         object_2_xyz_list.append(obj2)
         bool_contact_list.append(_gripper_touching_any(env))
+        current_success = bool(current_info.get("success", 0.0) > 0.0)
+        success_list.append(current_success)
+        success = success or current_success
         force_torque_sensor.update(env)
         force_torque_list.append(
             np.asarray(force_torque_sensor.read(), dtype=np.float32)
@@ -300,6 +368,7 @@ def collect_episode(
         if getattr(policy, "last_noise", None) is not None:
             action_noises.append(policy.last_noise.copy())
         obs, _reward, terminated, truncated, info = env.step(action)
+        current_info = dict(info or {})
 
         if info.get("success", 0.0) > 0.0:
             success = True
@@ -324,7 +393,9 @@ def collect_episode(
         "object_1_xyz": np.array(object_1_xyz_list, dtype=np.float32),
         "object_2_xyz": np.array(object_2_xyz_list, dtype=np.float32),
         "bool_contact": np.array(bool_contact_list, dtype=np.bool_),
+        "success": np.array(success_list, dtype=np.bool_),
         "action": np.array(actions, dtype=np.float32),
+        "hand_start_pos": hand_start_pos,
     }
     if len(expert_actions_raw) == len(actions):
         data_dict["expert_action_raw"] = np.array(expert_actions_raw, dtype=np.float32)
@@ -389,6 +460,9 @@ def worker_process(worker_id, env_names, args):
             task_group.attrs["randomize_every_reset"] = bool(
                 args.randomize_every_reset
             )
+            task_group.attrs["randomize_hand_start"] = bool(
+                args.randomize_hand_start
+            )
 
             episode_global_idx = 0
             env = env_cls(render_mode="rgb_array", camera_name=RGB_CAMERA_NAME)
@@ -412,7 +486,10 @@ def worker_process(worker_id, env_names, args):
                 lowpass_alpha=0.2,
             )
 
-            episode_policy_schedule = _build_episode_policy_schedule(args.num_episodes)
+            episode_policy_schedule = _build_episode_policy_schedule(
+                args.num_episodes,
+                policy_mode=args.policy_mode,
+            )
             for policy_type in episode_policy_schedule:
                 random_task = random.choice(available_tasks)
                 env.set_task(random_task)
@@ -432,6 +509,7 @@ def worker_process(worker_id, env_names, args):
                     tactile_sensor=tactile_sensor,
                     force_torque_sensor=force_torque_sensor,
                     policy_name=policy_metadata["policy_type"],
+                    randomize_hand_start=args.randomize_hand_start,
                 )
 
                 ep_group = task_group.create_group(f"episode_{episode_global_idx}")
@@ -456,6 +534,7 @@ def worker_process(worker_id, env_names, args):
                 ep_group.create_dataset("object_1_xyz", data=data_dict["object_1_xyz"])
                 ep_group.create_dataset("object_2_xyz", data=data_dict["object_2_xyz"])
                 ep_group.create_dataset("bool_contact", data=data_dict["bool_contact"])
+                ep_group.create_dataset("success", data=data_dict["success"])
                 ep_group.create_dataset("force_torque", data=data_dict["force_torque"])
                 ep_group.create_dataset("action", data=data_dict["action"])
 
@@ -463,6 +542,20 @@ def worker_process(worker_id, env_names, args):
                 ep_group.attrs["task_name"] = env_name
                 ep_group.attrs["randomize_every_reset"] = bool(
                     args.randomize_every_reset
+                )
+                ep_group.attrs["randomize_hand_start"] = bool(
+                    args.randomize_hand_start
+                )
+                ep_group.attrs["hand_start_pos"] = data_dict["hand_start_pos"]
+                ep_group.attrs["hand_low"] = np.asarray(env.hand_low, dtype=np.float32)
+                ep_group.attrs["hand_high"] = np.asarray(
+                    env.hand_high,
+                    dtype=np.float32,
+                )
+                success_steps = np.flatnonzero(data_dict["success"])
+                ep_group.attrs["episode_success"] = bool(success_steps.size > 0)
+                ep_group.attrs["first_success_step"] = (
+                    int(success_steps[0]) if success_steps.size > 0 else -1
                 )
                 for key, value in policy_metadata.items():
                     if key == "policy_type":
@@ -541,6 +634,21 @@ def full_data_collection(args):
     h5py = _require_h5py()
     mt50 = metaworld.MT50()
     all_env_names = list(mt50.train_classes.keys())
+
+    requested_tasks = _parse_task_names(args.tasks)
+    if requested_tasks is not None:
+        unknown_tasks = sorted(set(requested_tasks) - set(all_env_names))
+        if unknown_tasks:
+            available = ", ".join(sorted(all_env_names))
+            raise ValueError(
+                "Unknown MetaWorld task(s): "
+                f"{', '.join(unknown_tasks)}. Available tasks: {available}"
+            )
+        all_env_names = requested_tasks
+
+    if not all_env_names:
+        raise ValueError("No MetaWorld tasks selected for collection.")
+
     # Divide work
     num_workers = min(args.cpus, len(all_env_names))
 
@@ -557,7 +665,8 @@ def full_data_collection(args):
         chunks[worker_idx].append(env_name)
 
     print(
-        f"Spawning {len(chunks)} workers for {len(all_env_names)} environments...",
+        f"Spawning {len(chunks)} workers for {len(all_env_names)} environments: "
+        f"{', '.join(all_env_names)}",
         flush=True,
     )
 
@@ -601,6 +710,13 @@ def main():
         help="Total episodes to collect per environment across noisy expert and random walk behaviors",
     )
     parser.add_argument(
+        "--policy_mode",
+        type=str,
+        choices=("mixed", "expert_only", "random_walk_only"),
+        default="mixed",
+        help="Choose whether episodes are split between noisy expert and random walk, or collected from only one policy family.",
+    )
+    parser.add_argument(
         "--expert_noise_min",
         type=float,
         default=DEFAULT_EXPERT_NOISE_MIN,
@@ -615,10 +731,29 @@ def main():
     parser.add_argument("--dataset_path", type=str, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--temp_dir", type=str, default=DEFAULT_TEMP_DIR)
     parser.add_argument(
+        "--tasks",
+        nargs="+",
+        default=None,
+        help=(
+            "MetaWorld task names to collect. Accepts either space-separated "
+            "or comma-separated values, e.g. --tasks door-open-v3 reach-v3 "
+            "or --tasks door-open-v3,reach-v3. Defaults to all MT50 tasks."
+        ),
+    )
+    parser.add_argument(
         "--randomize_every_reset",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_RANDOMIZE_EVERY_RESET,
         help="If enabled, sample a fresh object/goal placement on every reset instead of using the frozen MT50 task layout",
+    )
+    parser.add_argument(
+        "--randomize_hand_start",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_RANDOMIZE_HAND_START,
+        help=(
+            "If enabled, sample the robot hand start position uniformly from "
+            "the task's hand_low/hand_high workspace before every episode reset."
+        ),
     )
     parser.add_argument(
         "--random_walk_direction_stddev",
