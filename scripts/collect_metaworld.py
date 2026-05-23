@@ -128,10 +128,7 @@ def _build_episode_policy_schedule(
     # Default mixed schedule: roughly 50/50 noisy expert and random walk.
     num_noisy_expert = (num_episodes + 1) // 2
     num_random_walk = num_episodes // 2
-    schedule = (
-        ["noisy_expert"] * num_noisy_expert
-        + ["random_walk"] * num_random_walk
-    )
+    schedule = ["noisy_expert"] * num_noisy_expert + ["random_walk"] * num_random_walk
     random.shuffle(schedule)
     return schedule
 
@@ -457,12 +454,8 @@ def worker_process(worker_id, env_names, args):
             # Create the Group ONCE per environment
             task_group = f.create_group(env_name)
             task_group.attrs["task_name"] = env_name
-            task_group.attrs["randomize_every_reset"] = bool(
-                args.randomize_every_reset
-            )
-            task_group.attrs["randomize_hand_start"] = bool(
-                args.randomize_hand_start
-            )
+            task_group.attrs["randomize_every_reset"] = bool(args.randomize_every_reset)
+            task_group.attrs["randomize_hand_start"] = bool(args.randomize_hand_start)
 
             episode_global_idx = 0
             env = env_cls(render_mode="rgb_array", camera_name=RGB_CAMERA_NAME)
@@ -521,9 +514,7 @@ def worker_process(worker_id, env_names, args):
                     data=data_dict["depth"],
                     compression="gzip",
                 )
-                ep_group.create_dataset(
-                    "proprio", data=data_dict["proprio"]
-                )
+                ep_group.create_dataset("proprio", data=data_dict["proprio"])
                 ep_group.create_dataset(
                     "tactile",
                     data=data_dict["tactile"],
@@ -543,9 +534,7 @@ def worker_process(worker_id, env_names, args):
                 ep_group.attrs["randomize_every_reset"] = bool(
                     args.randomize_every_reset
                 )
-                ep_group.attrs["randomize_hand_start"] = bool(
-                    args.randomize_hand_start
-                )
+                ep_group.attrs["randomize_hand_start"] = bool(args.randomize_hand_start)
                 ep_group.attrs["hand_start_pos"] = data_dict["hand_start_pos"]
                 ep_group.attrs["hand_low"] = np.asarray(env.hand_low, dtype=np.float32)
                 ep_group.attrs["hand_high"] = np.asarray(
