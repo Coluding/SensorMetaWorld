@@ -10,6 +10,7 @@ from typing import Any
 
 import gymnasium as gym
 import metaworld
+import mujoco
 import numpy as np
 from gymnasium import spaces
 
@@ -48,6 +49,37 @@ def _resize_array(image: np.ndarray, width: int, height: int) -> np.ndarray:
 def _set_randomized_resets(env: gym.Env, enabled: bool) -> None:
     """Allow fresh object/goal placement samples on every reset."""
     env.unwrapped._freeze_rand_vec = not enabled
+
+
+def _set_hand_start_position(env: gym.Env, hand_start_pos: np.ndarray) -> None:
+    """Set the next reset's Sawyer hand start position."""
+    hand_start_pos = np.asarray(hand_start_pos, dtype=np.float32)
+    env.hand_init_pos = hand_start_pos
+    if hasattr(env, "init_config") and "hand_init_pos" in env.init_config:
+        env.init_config["hand_init_pos"] = hand_start_pos
+
+
+def _cast_depth_frame(depth_frame: np.ndarray) -> np.ndarray:
+    """Match dataset storage by serving depth in half precision."""
+    return np.asarray(depth_frame, dtype=np.float16)
+
+
+def _quantize_tactile_frame(
+    tactile_frame: np.ndarray,
+    *,
+    sensor: TactileDigitSensor,
+) -> np.ndarray:
+    """Match dataset storage by serving one tactile map as uint8."""
+    if sensor.photometric_render:
+        max_value = 1.0 if sensor.normalize else 255.0
+    else:
+        max_value = 1.0 if sensor.normalize else float(sensor._PRESSURE_CLIP)
+
+    tactile_frame = np.asarray(tactile_frame, dtype=np.float32)
+    tactile_frame = np.clip(tactile_frame, 0.0, max_value)
+    if max_value > 0.0:
+        tactile_frame = tactile_frame * (255.0 / max_value)
+    return np.rint(tactile_frame).astype(np.uint8)
 
 
 def _render_rgb_frame(env: gym.Env, width: int, height: int) -> np.ndarray:
@@ -220,19 +252,16 @@ class MetaWorldAvidEnv(gym.Env):
 
     def _make_observation_space(self) -> spaces.Dict:
         depth_flat_space = self.depth_sensor.get_observation_space()
-        tactile_flat_space = self.tactile_sensor.get_observation_space()
         force_flat_space = self.force_torque_sensor.get_observation_space()
 
         if self.tactile_sensor.photometric_render:
             tactile_shape = (
-                2,
                 self.tactile_sensor.resolution,
                 self.tactile_sensor.resolution,
                 3,
             )
         else:
             tactile_shape = (
-                2,
                 self.tactile_sensor.resolution,
                 self.tactile_sensor.resolution,
             )
@@ -250,7 +279,7 @@ class MetaWorldAvidEnv(gym.Env):
                     low=float(np.min(depth_flat_space.low)),
                     high=float(np.max(depth_flat_space.high)),
                     shape=(self.depth_height, self.depth_width),
-                    dtype=np.float32,
+                    dtype=np.float16,
                 ),
                 "proprio": spaces.Box(
                     low=-np.inf,
@@ -259,10 +288,10 @@ class MetaWorldAvidEnv(gym.Env):
                     dtype=np.float32,
                 ),
                 "tactile": spaces.Box(
-                    low=float(np.min(tactile_flat_space.low)),
-                    high=float(np.max(tactile_flat_space.high)),
+                    low=0,
+                    high=255,
                     shape=tactile_shape,
-                    dtype=np.float32,
+                    dtype=np.uint8,
                 ),
                 "force_torque": spaces.Box(
                     low=float(np.min(force_flat_space.low)),
@@ -313,6 +342,70 @@ class MetaWorldAvidEnv(gym.Env):
                 self.metaworld_env.sawyer_observation_space
             )
 
+    def _set_state(
+        self,
+        qpos: np.ndarray,
+        qvel: np.ndarray,
+        rand_vec: np.ndarray | None = None,
+        target_pos: np.ndarray | None = None,
+        hand_start_pos: np.ndarray | None = None,
+    ) -> None:
+        """Replay a dataset start state into the wrapped MetaWorld env.
+
+        We first rebuild the env-specific randomized layout via ``reset_model()``
+        using the saved ``rand_vec`` / hand start, then overwrite the simulator
+        with the exact saved ``qpos`` from the dataset step while zeroing
+        velocities so rollouts do not inherit momentum from the recorded data.
+        """
+        env = self.metaworld_env
+
+        if hand_start_pos is not None:
+            _set_hand_start_position(
+                env, np.asarray(hand_start_pos, dtype=np.float32).copy()
+            )
+        if rand_vec is not None:
+            env._freeze_rand_vec = True
+            env._last_rand_vec = np.asarray(rand_vec, dtype=np.float64).copy()
+
+        env.reset_model()
+
+        qpos = np.asarray(qpos, dtype=np.float64).copy()
+        if qvel is None:
+            qvel = np.zeros_like(env.data.qvel, dtype=np.float64)
+        else:
+            qvel = np.zeros_like(np.asarray(qvel, dtype=np.float64).copy())
+        env.set_state(qpos, qvel)
+
+        if target_pos is not None:
+            env._target_pos = np.asarray(target_pos, dtype=np.float64).copy()
+            for site in env._target_site_config:
+                env._set_pos_site(*site)
+
+        env._prev_obs = env._get_curr_obs_combined_no_goal().copy()
+        env._last_stable_obs = env._get_obs()
+        mujoco.mj_forward(env.model, env.data)
+
+        self.depth_sensor.reset(env)
+        self.tactile_sensor.reset(env)
+        self.force_torque_sensor.reset(env)
+        self._elapsed_steps = 0
+
+    def _set_goal_state(self, target_pos: np.ndarray | None = None) -> None:
+        """Restore the task goal used during planning evaluation.
+
+        For single-task rollouts such as button-press, the target is fixed by the
+        episode randomization and storing the target position is enough to keep
+        the environment success metric aligned with the dataset goal.
+        """
+        if target_pos is None:
+            return
+
+        env = self.metaworld_env
+        env._target_pos = np.asarray(target_pos, dtype=np.float64).copy()
+        for site in env._target_site_config:
+            env._set_pos_site(*site)
+        mujoco.mj_forward(env.model, env.data)
+
     def reset(
         self,
         *,
@@ -355,11 +448,11 @@ class MetaWorldAvidEnv(gym.Env):
         )
 
         self.depth_sensor.update(self.metaworld_env)
-        depth = self.depth_sensor.get_depth_as_image().astype(np.float32)
+        depth = _cast_depth_frame(self.depth_sensor.get_depth_as_image())
 
         self.tactile_sensor.update(self.metaworld_env)
-        left_tactile, right_tactile = self.tactile_sensor.get_finger_images()
-        tactile = np.stack((left_tactile, right_tactile), axis=0).astype(np.float32)
+        _left_tactile, right_tactile = self.tactile_sensor.get_finger_images()
+        tactile = _quantize_tactile_frame(right_tactile, sensor=self.tactile_sensor)
 
         self.force_torque_sensor.update(self.metaworld_env)
         force_torque = np.asarray(self.force_torque_sensor.read(), dtype=np.float32)

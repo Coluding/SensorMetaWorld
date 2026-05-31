@@ -111,6 +111,29 @@ def _set_hand_start_position(env, hand_start_pos: np.ndarray) -> None:
         env.init_config["hand_init_pos"] = hand_start_pos
 
 
+def _cast_depth_frame(depth_frame: np.ndarray) -> np.ndarray:
+    """Store depth in half precision to cut dataset IO and disk size."""
+    return np.asarray(depth_frame, dtype=np.float16)
+
+
+def _quantize_tactile_frame(
+    tactile_frame: np.ndarray,
+    *,
+    sensor: TactileDigitSensor,
+) -> np.ndarray:
+    """Convert one tactile image into uint8 using the sensor's value range."""
+    if sensor.photometric_render:
+        max_value = 1.0 if sensor.normalize else 255.0
+    else:
+        max_value = 1.0 if sensor.normalize else float(sensor._PRESSURE_CLIP)
+
+    tactile_frame = np.asarray(tactile_frame, dtype=np.float32)
+    tactile_frame = np.clip(tactile_frame, 0.0, max_value)
+    if max_value > 0.0:
+        tactile_frame = tactile_frame * (255.0 / max_value)
+    return np.rint(tactile_frame).astype(np.uint8)
+
+
 def _build_episode_policy_schedule(
     num_episodes: int,
     policy_mode: str = "mixed",
@@ -299,6 +322,7 @@ def collect_episode(
     """
     Runs one episode and returns a DICTIONARY.
     Always returns data, even if expert fails.
+    Episodes terminate immediately after the first successful env step.
     """
     if randomize_hand_start:
         hand_start_pos = _sample_hand_start_position(env)
@@ -324,6 +348,11 @@ def collect_episode(
     bool_contact_list = []
     success_list = []
     force_torque_list = []
+    qpos_list = []
+    qvel_list = []
+    rand_vec_list = []
+    target_pos_list = []
+    hand_start_pos_list = []
     actions = []
     expert_actions_raw = []
     expert_actions_clipped = []
@@ -335,11 +364,14 @@ def collect_episode(
         rgb_frames.append(_render_rgb_frame(env))
 
         depth_sensor.update(env)
-        depth_frames.append(depth_sensor.get_depth_as_image().copy())
+        depth_frames.append(_cast_depth_frame(depth_sensor.get_depth_as_image()))
 
         tactile_sensor.update(env)
-        left_tactile, right_tactile = tactile_sensor.get_finger_images()
-        tactile_frames.append(np.stack((left_tactile, right_tactile), axis=0))
+        # Keep only the right fingertip to cut tactile IO in half.
+        _left_tactile, right_tactile = tactile_sensor.get_finger_images()
+        tactile_frames.append(
+            _quantize_tactile_frame(right_tactile, sensor=tactile_sensor)
+        )
 
         proprioception_list.append(env.data.qpos[:7].copy())
         gripper_list.append(np.float32(obs[3]))
@@ -348,6 +380,15 @@ def collect_episode(
         object_1_xyz_list.append(obj1)
         object_2_xyz_list.append(obj2)
         bool_contact_list.append(_gripper_touching_any(env))
+        qpos_list.append(np.asarray(env.data.qpos, dtype=np.float32).copy())
+        qvel_list.append(np.asarray(env.data.qvel, dtype=np.float32).copy())
+        rand_vec = getattr(env, "_last_rand_vec", None)
+        if rand_vec is not None:
+            rand_vec_list.append(np.asarray(rand_vec, dtype=np.float32).copy())
+        target_pos = getattr(env, "_target_pos", None)
+        if target_pos is not None:
+            target_pos_list.append(np.asarray(target_pos, dtype=np.float32).copy())
+        hand_start_pos_list.append(np.asarray(hand_start_pos, dtype=np.float32).copy())
         current_success = bool(current_info.get("success", 0.0) > 0.0)
         success_list.append(current_success)
         success = success or current_success
@@ -369,6 +410,11 @@ def collect_episode(
 
         if info.get("success", 0.0) > 0.0:
             success = True
+            # The action taken at this collected step achieved success, so mark
+            # the final stored timestep accordingly before ending the episode.
+            if success_list:
+                success_list[-1] = True
+            break
 
         if terminated or truncated:
             break
@@ -381,9 +427,9 @@ def collect_episode(
 
     data_dict = {
         "pixels": np.array(rgb_frames, dtype=np.uint8),
-        "depth": np.array(depth_frames, dtype=np.float32),
+        "depth": np.array(depth_frames, dtype=np.float16),
         "proprio": np.array(proprioception_list, dtype=np.float32),
-        "tactile": np.array(tactile_frames, dtype=np.float32),
+        "tactile": np.array(tactile_frames, dtype=np.uint8),
         "force_torque": np.array(force_torque_list, dtype=np.float32),
         "gripper": np.array(gripper_list, dtype=np.float32),
         "ee_xyz": np.array(ee_xyz_list, dtype=np.float32),
@@ -392,8 +438,14 @@ def collect_episode(
         "bool_contact": np.array(bool_contact_list, dtype=np.bool_),
         "success": np.array(success_list, dtype=np.bool_),
         "action": np.array(actions, dtype=np.float32),
-        "hand_start_pos": hand_start_pos,
+        "qpos": np.array(qpos_list, dtype=np.float32),
+        "qvel": np.array(qvel_list, dtype=np.float32),
+        "hand_start_pos": np.array(hand_start_pos_list, dtype=np.float32),
     }
+    if len(rand_vec_list) == len(actions):
+        data_dict["rand_vec"] = np.array(rand_vec_list, dtype=np.float32)
+    if len(target_pos_list) == len(actions):
+        data_dict["target_pos"] = np.array(target_pos_list, dtype=np.float32)
     if len(expert_actions_raw) == len(actions):
         data_dict["expert_action_raw"] = np.array(expert_actions_raw, dtype=np.float32)
     if len(expert_actions_clipped) == len(actions):
@@ -528,6 +580,17 @@ def worker_process(worker_id, env_names, args):
                 ep_group.create_dataset("success", data=data_dict["success"])
                 ep_group.create_dataset("force_torque", data=data_dict["force_torque"])
                 ep_group.create_dataset("action", data=data_dict["action"])
+                ep_group.create_dataset("qpos", data=data_dict["qpos"])
+                ep_group.create_dataset("qvel", data=data_dict["qvel"])
+                ep_group.create_dataset(
+                    "hand_start_pos", data=data_dict["hand_start_pos"]
+                )
+                if "rand_vec" in data_dict:
+                    ep_group.create_dataset("rand_vec", data=data_dict["rand_vec"])
+                if "target_pos" in data_dict:
+                    ep_group.create_dataset(
+                        "target_pos", data=data_dict["target_pos"]
+                    )
 
                 ep_group.attrs["policy_type"] = policy_metadata["policy_type"]
                 ep_group.attrs["task_name"] = env_name
@@ -535,7 +598,7 @@ def worker_process(worker_id, env_names, args):
                     args.randomize_every_reset
                 )
                 ep_group.attrs["randomize_hand_start"] = bool(args.randomize_hand_start)
-                ep_group.attrs["hand_start_pos"] = data_dict["hand_start_pos"]
+                ep_group.attrs["hand_start_pos"] = data_dict["hand_start_pos"][0]
                 ep_group.attrs["hand_low"] = np.asarray(env.hand_low, dtype=np.float32)
                 ep_group.attrs["hand_high"] = np.asarray(
                     env.hand_high,
@@ -795,7 +858,7 @@ def main():
     if args.random_walk_max_step <= args.random_walk_min_step:
         parser.error("random_walk_max_step must be greater than random_walk_min_step")
 
-    print(f"Initializing Meta-World MT50 (Main Process)...", flush=True)
+    print("Initializing Meta-World MT50 (Main Process)...", flush=True)
 
     if args.explore_qpos:
         explore_qpos()
