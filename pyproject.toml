@@ -28,7 +28,11 @@ dependencies = [
     "mujoco>=3.0.0",
     "numpy>=1.18",
     "scipy>=1.4.1",
-    "imageio"
+    "imageio",
+    "packaging>=26.0",
+    "matplotlib>=3.10.9",
+    "opencv-python>=4.13.0.92",
+    "h5py>=3.16.0",
 ]
 
 [project.optional-dependencies]

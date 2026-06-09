@@ -6,6 +6,7 @@ import random
 import argparse
 import multiprocessing
 import os
+os.environ.setdefault("MUJOCO_GL", "egl")
 import mujoco
 from metaworld_policies import (
     MetaWorldPolicy,
@@ -18,26 +19,56 @@ from metaworld.sensors.visual import DepthCameraSensor
 
 from pathlib import Path
 
+
 # Defaults
-DEFAULT_DATASET_PATH = "data/metaworld/metaworld_corner2.hdf5"
+DEFAULT_DATASET_PATH = "data/metaworld/metaworld_corner2_large2.hdf5"
 DEFAULT_TEMP_DIR = "data/metaworld/temp/"
-DEFAULT_NUM_EPISODES = 1
+DEFAULT_NUM_EPISODES = 300
 DEFAULT_EXPERT_NOISE_MIN = 0.1
-DEFAULT_EXPERT_NOISE_MAX = 0.25
+DEFAULT_EXPERT_NOISE_MAX = 0.5
 DEFAULT_RANDOMIZE_EVERY_RESET = True
-DEFAULT_RANDOM_WALK_DIRECTION_STDDEV = 0.45
+DEFAULT_RANDOM_WALK_DIRECTION_STDDEV = 0.35
 DEFAULT_RANDOM_WALK_GRAVITY_STRENGTH = 0.01
 DEFAULT_RANDOM_WALK_LEVY_ALPHA = 1.35
 DEFAULT_RANDOM_WALK_MIN_STEP = 1.0
 DEFAULT_RANDOM_WALK_MAX_STEP = 4.0
-MAX_STEPS = 200
-RGB_CAMERA_NAME = "corner2"
-DEPTH_CAMERA_NAME = RGB_CAMERA_NAME
+MAX_STEPS = 500
+DEFAULT_CAMERA_NAMES = ("corner2", )
+AVAILABLE_CAMERA_NAMES = (
+    "corner",
+    "corner2",
+    "corner3",
+    "corner4",
+    "topview",
+    "behindGripper",
+    "gripperPOV",
+)
 RGB_IMAGE_WIDTH = 128
 RGB_IMAGE_HEIGHT = 128
 DEPTH_IMAGE_WIDTH = 128
 DEPTH_IMAGE_HEIGHT = 128
 TACTILE_RESOLUTION = 64
+FRAME_AGGREGATIONS = ("first", "mean", "max", "sum")
+
+
+def _aggregate_window(values: list, mode: str) -> np.ndarray:
+    """Reduce a list of per-tick sensor readings into a single frame.
+
+    ``first`` returns the value at the window boundary (no aggregation);
+    ``mean``/``max``/``sum`` reduce element-wise across the stride window.
+    Boolean readings (e.g. bool_contact) collapse to "any in window" for
+    max/sum/mean once cast back to bool downstream.
+    """
+    arr = np.stack(values, axis=0)
+    if mode == "first":
+        return arr[0]
+    if mode == "mean":
+        return arr.mean(axis=0)
+    if mode == "max":
+        return arr.max(axis=0)
+    if mode == "sum":
+        return arr.sum(axis=0)
+    raise ValueError(f"Unknown frame_aggregation: {mode}")
 
 
 def _require_h5py():
@@ -199,8 +230,23 @@ def _gripper_touching_any(env) -> bool:
             return False
 
 
-def _render_rgb_frame(env) -> np.ndarray:
-    """Render one RGB frame from the environment's configured camera."""
+def _resolve_camera_id(env, camera_name: str) -> int:
+    """Resolve a MuJoCo camera name to its integer id for the given env."""
+    try:
+        return int(env.unwrapped.model.camera(camera_name).id)
+    except KeyError:
+        available = [
+            env.unwrapped.model.camera(i).name
+            for i in range(env.unwrapped.model.ncam)
+        ]
+        raise RuntimeError(
+            f"Camera '{camera_name}' not found in MuJoCo model. "
+            f"Available cameras: {available}"
+        )
+
+
+def _render_rgb_frame(env, camera_id: int) -> np.ndarray:
+    """Render one RGB frame from the given camera id."""
     frame = None
     renderer = getattr(env.unwrapped, "mujoco_renderer", None)
 
@@ -209,13 +255,14 @@ def _render_rgb_frame(env) -> np.ndarray:
         if callable(get_viewer):
             try:
                 viewer = get_viewer(render_mode="rgb_array")
-                # The depth sensor uses its own offscreen OpenGL context. Make the
-                # RGB viewer current again before reading pixels or MuJoCo can
-                # return all-black frames after the first depth render.
+                # The depth sensor renders through this same offscreen viewer
+                # (with render_mode="depth_array"). Make the context current
+                # again before reading pixels or MuJoCo can return all-black
+                # frames after the first depth render.
                 viewer.make_context_current()
                 frame = viewer.render(
                     render_mode="rgb_array",
-                    camera_id=renderer.camera_id,
+                    camera_id=camera_id,
                 )
             except Exception:
                 frame = None
@@ -235,25 +282,44 @@ def collect_episode(
     env,
     policy: MetaWorldPolicy,
     task_name: str,
-    depth_sensor: DepthCameraSensor,
+    depth_sensors: dict[str, DepthCameraSensor],
     tactile_sensor: TactileDigitSensor,
     force_torque_sensor: ForceTorqueSensor,
+    camera_names: list[str],
     max_steps: int = MAX_STEPS,
     reset_seed: int | None = None,
     policy_name: str = "policy",
+    frame_stride: int = 1,
+    frame_aggregation: str = "first",
 ):
     """
     Runs one episode and returns a DICTIONARY.
     Always returns data, even if expert fails.
+
+    The single rollout is rendered from every camera in ``camera_names`` (each
+    gets its own RGB ``pixels`` and ``depth`` frame); ``depth_sensors`` maps
+    each camera name to a DepthCameraSensor bound to it. The camera-independent
+    sensors (proprio, tactile, force_torque, gripper, ee/object xyz,
+    bool_contact, action) are collected once and shared across all views.
+
+    The policy is stepped on every control tick so dynamics stay smooth, but the
+    trajectory is downsampled by ``frame_stride`` to lower the effective fps.
+    Numeric sensors are buffered every tick and reduced per window via
+    ``frame_aggregation`` (first/mean/max/sum). RGB/depth are not aggregated:
+    one frame per camera is sampled at each window boundary, avoiding image
+    blurring and per-tick render cost. ``frame_stride=1`` keeps the original
+    behaviour regardless of ``frame_aggregation``.
     """
     obs, _ = env.reset(seed=reset_seed)
-    depth_sensor.reset(env)
+    for depth_sensor in depth_sensors.values():
+        depth_sensor.reset(env)
     tactile_sensor.reset(env)
     force_torque_sensor.reset(env)
     _initialize_policy_reference_position(env, policy, obs)
 
-    rgb_frames = []
-    depth_frames = []
+    rgb_camera_ids = {cam: _resolve_camera_id(env, cam) for cam in camera_names}
+    rgb_frames = {cam: [] for cam in camera_names}
+    depth_frames = {cam: [] for cam in camera_names}
     tactile_frames = []
     proprioception_list = []
     gripper_list = []
@@ -267,38 +333,108 @@ def collect_episode(
     expert_actions_clipped = []
     action_noises = []
 
+    # Per-tick buffers for the current frame_stride window. Numeric sensors are
+    # accumulated every control tick and reduced into one frame per window via
+    # `frame_aggregation`; RGB/depth images are sampled once at each window
+    # boundary (see below) rather than aggregated.
+    window = {
+        "tactile": [],
+        "proprio": [],
+        "gripper": [],
+        "ee_xyz": [],
+        "object_1_xyz": [],
+        "object_2_xyz": [],
+        "bool_contact": [],
+        "force_torque": [],
+        "action": [],
+        "expert_action_raw": [],
+        "expert_action_clipped": [],
+        "action_noise": [],
+    }
+
+    def _flush_window():
+        """Reduce the buffered window into one frame per numeric sensor."""
+        if not window["action"]:
+            return
+        tactile_frames.append(_aggregate_window(window["tactile"], frame_aggregation))
+        proprioception_list.append(
+            _aggregate_window(window["proprio"], frame_aggregation)
+        )
+        gripper_list.append(_aggregate_window(window["gripper"], frame_aggregation))
+        ee_xyz_list.append(_aggregate_window(window["ee_xyz"], frame_aggregation))
+        object_1_xyz_list.append(
+            _aggregate_window(window["object_1_xyz"], frame_aggregation)
+        )
+        object_2_xyz_list.append(
+            _aggregate_window(window["object_2_xyz"], frame_aggregation)
+        )
+        bool_contact_list.append(
+            _aggregate_window(window["bool_contact"], frame_aggregation)
+        )
+        force_torque_list.append(
+            _aggregate_window(window["force_torque"], frame_aggregation)
+        )
+        actions.append(_aggregate_window(window["action"], frame_aggregation))
+        if window["expert_action_raw"]:
+            expert_actions_raw.append(
+                _aggregate_window(window["expert_action_raw"], frame_aggregation)
+            )
+        if window["expert_action_clipped"]:
+            expert_actions_clipped.append(
+                _aggregate_window(window["expert_action_clipped"], frame_aggregation)
+            )
+        if window["action_noise"]:
+            action_noises.append(
+                _aggregate_window(window["action_noise"], frame_aggregation)
+            )
+        for buf in window.values():
+            buf.clear()
+
     success = False
 
-    for _ in range(max_steps):
-        rgb_frames.append(_render_rgb_frame(env))
+    for step_idx in range(max_steps):
+        # Force-torque low-pass filter must see every control tick.
+        force_torque_sensor.update(env)
 
-        depth_sensor.update(env)
-        depth_frames.append(depth_sensor.get_depth_as_image().copy())
+        if (step_idx % frame_stride) == 0:
+            # Start of a new window: flush the previous window, then sample the
+            # images that represent this window at its boundary, once per camera.
+            _flush_window()
+            for cam in camera_names:
+                rgb_frames[cam].append(
+                    _render_rgb_frame(env, rgb_camera_ids[cam])
+                )
+                depth_sensors[cam].update(env)
+                depth_frames[cam].append(
+                    depth_sensors[cam].get_depth_as_image().copy()
+                )
 
         tactile_sensor.update(env)
         left_tactile, right_tactile = tactile_sensor.get_finger_images()
-        tactile_frames.append(np.stack((left_tactile, right_tactile), axis=0))
-
-        proprioception_list.append(env.data.qpos[:7].copy())
-        gripper_list.append(np.float32(obs[3]))
-        ee_xyz_list.append(np.asarray(env.get_endeff_pos(), dtype=np.float32).copy())
+        window["tactile"].append(np.stack((left_tactile, right_tactile), axis=0))
+        window["proprio"].append(env.data.qpos[:7].copy())
+        window["gripper"].append(np.float32(obs[3]))
+        window["ee_xyz"].append(
+            np.asarray(env.get_endeff_pos(), dtype=np.float32).copy()
+        )
         obj1, obj2 = _get_object_xyzs(env)
-        object_1_xyz_list.append(obj1)
-        object_2_xyz_list.append(obj2)
-        bool_contact_list.append(_gripper_touching_any(env))
-        force_torque_sensor.update(env)
-        force_torque_list.append(
+        window["object_1_xyz"].append(obj1)
+        window["object_2_xyz"].append(obj2)
+        window["bool_contact"].append(_gripper_touching_any(env))
+        window["force_torque"].append(
             np.asarray(force_torque_sensor.read(), dtype=np.float32)
         )
 
         action = np.asarray(policy.get_action(obs), dtype=np.float32)
-        actions.append(action)
+        window["action"].append(action)
         if getattr(policy, "last_expert_action_raw", None) is not None:
-            expert_actions_raw.append(policy.last_expert_action_raw.copy())
+            window["expert_action_raw"].append(policy.last_expert_action_raw.copy())
         if getattr(policy, "last_expert_action_clipped", None) is not None:
-            expert_actions_clipped.append(policy.last_expert_action_clipped.copy())
+            window["expert_action_clipped"].append(
+                policy.last_expert_action_clipped.copy()
+            )
         if getattr(policy, "last_noise", None) is not None:
-            action_noises.append(policy.last_noise.copy())
+            window["action_noise"].append(policy.last_noise.copy())
         obs, _reward, terminated, truncated, info = env.step(action)
 
         if info.get("success", 0.0) > 0.0:
@@ -307,15 +443,25 @@ def collect_episode(
         if terminated or truncated:
             break
 
+    # Reduce the final (possibly partial) window.
+    _flush_window()
+
     if not success and policy_name != "random_walk":
         print(
             f"  [Warn] {policy_name} rollout failed on {task_name} but saving anyway.",
             flush=True,
         )
 
-    data_dict = {
-        "pixels": np.array(rgb_frames, dtype=np.uint8),
-        "depth": np.array(depth_frames, dtype=np.float32),
+    # Per-camera image views (pixels + depth), keyed by camera name.
+    cameras = {
+        cam: {
+            "pixels": np.array(rgb_frames[cam], dtype=np.uint8),
+            "depth": np.array(depth_frames[cam], dtype=np.float32),
+        }
+        for cam in camera_names
+    }
+    # Camera-independent sensors, shared across all views.
+    sensors = {
         "proprio": np.array(proprioception_list, dtype=np.float32),
         "tactile": np.array(tactile_frames, dtype=np.float32),
         "force_torque": np.array(force_torque_list, dtype=np.float32),
@@ -327,14 +473,14 @@ def collect_episode(
         "action": np.array(actions, dtype=np.float32),
     }
     if len(expert_actions_raw) == len(actions):
-        data_dict["expert_action_raw"] = np.array(expert_actions_raw, dtype=np.float32)
+        sensors["expert_action_raw"] = np.array(expert_actions_raw, dtype=np.float32)
     if len(expert_actions_clipped) == len(actions):
-        data_dict["expert_action_clipped"] = np.array(
+        sensors["expert_action_clipped"] = np.array(
             expert_actions_clipped, dtype=np.float32
         )
     if len(action_noises) == len(actions):
-        data_dict["action_noise"] = np.array(action_noises, dtype=np.float32)
-    return data_dict
+        sensors["action_noise"] = np.array(action_noises, dtype=np.float32)
+    return {"cameras": cameras, "sensors": sensors}
 
 
 def worker_process(worker_id, env_names, args):
@@ -389,15 +535,21 @@ def worker_process(worker_id, env_names, args):
             task_group.attrs["randomize_every_reset"] = bool(
                 args.randomize_every_reset
             )
+            task_group.attrs["frame_stride"] = int(args.frame_stride)
+            task_group.attrs["frame_aggregation"] = str(args.frame_aggregation)
+            task_group.attrs["camera_names"] = list(args.cameras)
 
             episode_global_idx = 0
-            env = env_cls(render_mode="rgb_array", camera_name=RGB_CAMERA_NAME)
-            depth_sensor = DepthCameraSensor(
-                camera_name=DEPTH_CAMERA_NAME,
-                height=DEPTH_IMAGE_HEIGHT,
-                width=DEPTH_IMAGE_WIDTH,
-                normalize=False,
-            )
+            env = env_cls(render_mode="rgb_array", camera_name=args.cameras[0])
+            depth_sensors = {
+                cam: DepthCameraSensor(
+                    camera_name=cam,
+                    height=DEPTH_IMAGE_HEIGHT,
+                    width=DEPTH_IMAGE_WIDTH,
+                    normalize=False,
+                )
+                for cam in args.cameras
+            }
             tactile_sensor = TactileDigitSensor(
                 resolution=TACTILE_RESOLUTION,
                 noise_std=0.0,
@@ -428,46 +580,70 @@ def worker_process(worker_id, env_names, args):
                     env=env,
                     policy=policy,
                     task_name=env_name,
-                    depth_sensor=depth_sensor,
+                    depth_sensors=depth_sensors,
                     tactile_sensor=tactile_sensor,
                     force_torque_sensor=force_torque_sensor,
+                    camera_names=list(args.cameras),
                     policy_name=policy_metadata["policy_type"],
+                    frame_stride=args.frame_stride,
+                    frame_aggregation=args.frame_aggregation,
                 )
 
-                ep_group = task_group.create_group(f"episode_{episode_global_idx}")
-                ep_group.create_dataset(
-                    "pixels", data=data_dict["pixels"], compression="gzip"
-                )
-                ep_group.create_dataset(
-                    "depth",
-                    data=data_dict["depth"],
-                    compression="gzip",
-                )
-                ep_group.create_dataset(
-                    "proprio", data=data_dict["proprio"]
-                )
-                ep_group.create_dataset(
-                    "tactile",
-                    data=data_dict["tactile"],
-                    compression="gzip",
-                )
-                ep_group.create_dataset("gripper", data=data_dict["gripper"])
-                ep_group.create_dataset("ee_xyz", data=data_dict["ee_xyz"])
-                ep_group.create_dataset("object_1_xyz", data=data_dict["object_1_xyz"])
-                ep_group.create_dataset("object_2_xyz", data=data_dict["object_2_xyz"])
-                ep_group.create_dataset("bool_contact", data=data_dict["bool_contact"])
-                ep_group.create_dataset("force_torque", data=data_dict["force_torque"])
-                ep_group.create_dataset("action", data=data_dict["action"])
+                episode_key = f"episode_{episode_global_idx}"
 
-                ep_group.attrs["policy_type"] = policy_metadata["policy_type"]
-                ep_group.attrs["task_name"] = env_name
-                ep_group.attrs["randomize_every_reset"] = bool(
+                # Per-camera image views: <env>/<camera>/episode_N/{pixels, depth}
+                for cam, cam_data in data_dict["cameras"].items():
+                    cam_group = task_group.require_group(cam)
+                    cam_ep_group = cam_group.create_group(episode_key)
+                    cam_ep_group.create_dataset(
+                        "pixels", data=cam_data["pixels"], compression="gzip"
+                    )
+                    cam_ep_group.create_dataset(
+                        "depth", data=cam_data["depth"], compression="gzip"
+                    )
+
+                # Shared, camera-independent sensors: <env>/sensors/episode_N/*
+                sensors_group = task_group.require_group("sensors")
+                sensor_ep_group = sensors_group.create_group(episode_key)
+                sensor_data = data_dict["sensors"]
+                sensor_ep_group.create_dataset("proprio", data=sensor_data["proprio"])
+                sensor_ep_group.create_dataset(
+                    "tactile", data=sensor_data["tactile"], compression="gzip"
+                )
+                sensor_ep_group.create_dataset("gripper", data=sensor_data["gripper"])
+                sensor_ep_group.create_dataset("ee_xyz", data=sensor_data["ee_xyz"])
+                sensor_ep_group.create_dataset(
+                    "object_1_xyz", data=sensor_data["object_1_xyz"]
+                )
+                sensor_ep_group.create_dataset(
+                    "object_2_xyz", data=sensor_data["object_2_xyz"]
+                )
+                sensor_ep_group.create_dataset(
+                    "bool_contact", data=sensor_data["bool_contact"]
+                )
+                sensor_ep_group.create_dataset(
+                    "force_torque", data=sensor_data["force_torque"]
+                )
+                sensor_ep_group.create_dataset("action", data=sensor_data["action"])
+                for optional_key in (
+                    "expert_action_raw",
+                    "expert_action_clipped",
+                    "action_noise",
+                ):
+                    if optional_key in sensor_data:
+                        sensor_ep_group.create_dataset(
+                            optional_key, data=sensor_data[optional_key]
+                        )
+
+                sensor_ep_group.attrs["policy_type"] = policy_metadata["policy_type"]
+                sensor_ep_group.attrs["task_name"] = env_name
+                sensor_ep_group.attrs["randomize_every_reset"] = bool(
                     args.randomize_every_reset
                 )
                 for key, value in policy_metadata.items():
                     if key == "policy_type":
                         continue
-                    ep_group.attrs[key] = value
+                    sensor_ep_group.attrs[key] = value
 
                 episode_global_idx += 1
 
@@ -612,6 +788,34 @@ def main():
         default=DEFAULT_EXPERT_NOISE_MAX,
         help="Maximum per-episode Gaussian noise scale for expert actions",
     )
+    parser.add_argument(
+        "--frame_stride",
+        type=int,
+        default=1,
+        help="Record one frame every N control steps. The policy still steps "
+        "every tick, but only every Nth frame is saved, lowering the effective "
+        "fps of the saved trajectory by this factor (1 = record every step).",
+    )
+    parser.add_argument(
+        "--frame_aggregation",
+        type=str,
+        default="first",
+        choices=FRAME_AGGREGATIONS,
+        help="How to reduce numeric sensors over each frame_stride window: "
+        "'first' samples the boundary value (no aggregation), 'mean'/'max'/'sum' "
+        "reduce element-wise. RGB/depth images are always sampled, never aggregated.",
+    )
+    parser.add_argument(
+        "--cameras",
+        type=str,
+        nargs="+",
+        default=list(DEFAULT_CAMERA_NAMES),
+        choices=AVAILABLE_CAMERA_NAMES,
+        metavar="CAMERA",
+        help="One or more camera names to render each rollout from. Each camera "
+        "produces its own pixels+depth under <env>/<camera>/episode_N/; the "
+        f"default is {list(DEFAULT_CAMERA_NAMES)}. Choices: {list(AVAILABLE_CAMERA_NAMES)}.",
+    )
     parser.add_argument("--dataset_path", type=str, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--temp_dir", type=str, default=DEFAULT_TEMP_DIR)
     parser.add_argument(
@@ -670,6 +874,10 @@ def main():
         parser.error("random_walk_min_step must be positive")
     if args.random_walk_max_step <= args.random_walk_min_step:
         parser.error("random_walk_max_step must be greater than random_walk_min_step")
+    if args.frame_stride < 1:
+        parser.error("frame_stride must be a positive integer")
+    if len(set(args.cameras)) != len(args.cameras):
+        parser.error("--cameras must not contain duplicate camera names")
 
     print(f"Initializing Meta-World MT50 (Main Process)...", flush=True)
 
