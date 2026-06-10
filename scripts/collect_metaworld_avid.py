@@ -21,9 +21,9 @@ from pathlib import Path
 
 
 # Defaults
-DEFAULT_DATASET_PATH = "data/metaworld/metaworld_corner2_large2.hdf5"
+DEFAULT_DATASET_PATH = "data/metaworld/mw_test_zoom.hdf5"
 DEFAULT_TEMP_DIR = "data/metaworld/temp/"
-DEFAULT_NUM_EPISODES = 300
+DEFAULT_NUM_EPISODES = 1
 DEFAULT_EXPERT_NOISE_MIN = 0.1
 DEFAULT_EXPERT_NOISE_MAX = 0.5
 DEFAULT_RANDOMIZE_EVERY_RESET = True
@@ -245,6 +245,24 @@ def _resolve_camera_id(env, camera_name: str) -> int:
         )
 
 
+def _apply_camera_zoom(env, camera_names, zoom_factor: float) -> None:
+    """Optically zoom the given cameras by narrowing their field of view.
+
+    Dividing a MuJoCo camera's ``fovy`` by ``zoom_factor`` concentrates the
+    full render resolution onto a smaller central region, so objects appear
+    larger and finer detail is resolved with no interpolation/cropping loss.
+    Because RGB and depth render through the same model camera, both views are
+    zoomed identically; depth *distances* are unaffected (only the projection
+    changes). ``zoom_factor == 1.0`` is a no-op.
+    """
+    if zoom_factor == 1.0:
+        return
+    model = env.unwrapped.model
+    for camera_name in camera_names:
+        camera_id = _resolve_camera_id(env, camera_name)
+        model.cam_fovy[camera_id] = model.cam_fovy[camera_id] / zoom_factor
+
+
 def _render_rgb_frame(env, camera_id: int) -> np.ndarray:
     """Render one RGB frame from the given camera id."""
     frame = None
@@ -291,6 +309,7 @@ def collect_episode(
     policy_name: str = "policy",
     frame_stride: int = 1,
     frame_aggregation: str = "first",
+    action_repeat: int = 1,
 ):
     """
     Runs one episode and returns a DICTIONARY.
@@ -302,13 +321,26 @@ def collect_episode(
     sensors (proprio, tactile, force_torque, gripper, ee/object xyz,
     bool_contact, action) are collected once and shared across all views.
 
-    The policy is stepped on every control tick so dynamics stay smooth, but the
-    trajectory is downsampled by ``frame_stride`` to lower the effective fps.
-    Numeric sensors are buffered every tick and reduced per window via
-    ``frame_aggregation`` (first/mean/max/sum). RGB/depth are not aggregated:
-    one frame per camera is sampled at each window boundary, avoiding image
-    blurring and per-tick render cost. ``frame_stride=1`` keeps the original
-    behaviour regardless of ``frame_aggregation``.
+    Two distinct mechanisms downsample the saved trajectory:
+
+    * ``frame_stride``: the policy is re-queried with a fresh observation on
+      every control tick (so the controller reacts at full rate and dynamics
+      stay smooth), but only every ``frame_stride``-th frame is stored.
+    * ``action_repeat``: the policy is queried once per block of
+      ``action_repeat`` ticks; that single action is *committed* (re-applied
+      unchanged) for the whole block, and only the block's initial frame is
+      stored. This is classic action-repeat / frame-skip — it produces larger
+      inter-frame motion (better dynamics for video prediction) because the
+      controller cannot correct mid-block.
+
+    They are mutually exclusive (enforced by the CLI); whichever is >1 sets the
+    storage window length. Numeric sensors are buffered every tick and reduced
+    per window via ``frame_aggregation`` (first/mean/max/sum) — with
+    ``action_repeat`` the action is constant over the window, so ``first``
+    yields the committed action. RGB/depth are not aggregated: one frame per
+    camera is sampled at each window boundary, avoiding image blurring and
+    per-tick render cost. ``frame_stride=1`` and ``action_repeat=1`` keep the
+    original behaviour regardless of ``frame_aggregation``.
     """
     obs, _ = env.reset(seed=reset_seed)
     for depth_sensor in depth_sensors.values():
@@ -392,11 +424,19 @@ def collect_episode(
 
     success = False
 
+    # Whichever of frame_stride / action_repeat is >1 defines the storage
+    # window (they are mutually exclusive). With action_repeat the policy
+    # commits one action per window instead of being re-queried every tick.
+    stride = max(frame_stride, action_repeat)
+    commit_action = action_repeat > 1
+    cached_action = None
+
     for step_idx in range(max_steps):
         # Force-torque low-pass filter must see every control tick.
         force_torque_sensor.update(env)
 
-        if (step_idx % frame_stride) == 0:
+        is_window_start = (step_idx % stride) == 0
+        if is_window_start:
             # Start of a new window: flush the previous window, then sample the
             # images that represent this window at its boundary, once per camera.
             _flush_window()
@@ -425,7 +465,12 @@ def collect_episode(
             np.asarray(force_torque_sensor.read(), dtype=np.float32)
         )
 
-        action = np.asarray(policy.get_action(obs), dtype=np.float32)
+        # In action_repeat mode the policy is queried only at the window start
+        # (using that block's initial observation) and the action is held
+        # constant for the rest of the block; otherwise it reacts every tick.
+        if (not commit_action) or (cached_action is None) or is_window_start:
+            cached_action = np.asarray(policy.get_action(obs), dtype=np.float32)
+        action = cached_action
         window["action"].append(action)
         if getattr(policy, "last_expert_action_raw", None) is not None:
             window["expert_action_raw"].append(policy.last_expert_action_raw.copy())
@@ -537,10 +582,13 @@ def worker_process(worker_id, env_names, args):
             )
             task_group.attrs["frame_stride"] = int(args.frame_stride)
             task_group.attrs["frame_aggregation"] = str(args.frame_aggregation)
+            task_group.attrs["action_repeat"] = int(args.action_repeat)
+            task_group.attrs["zoom_factor"] = float(args.zoom_factor)
             task_group.attrs["camera_names"] = list(args.cameras)
 
             episode_global_idx = 0
             env = env_cls(render_mode="rgb_array", camera_name=args.cameras[0])
+            _apply_camera_zoom(env, args.cameras, args.zoom_factor)
             depth_sensors = {
                 cam: DepthCameraSensor(
                     camera_name=cam,
@@ -587,6 +635,7 @@ def worker_process(worker_id, env_names, args):
                     policy_name=policy_metadata["policy_type"],
                     frame_stride=args.frame_stride,
                     frame_aggregation=args.frame_aggregation,
+                    action_repeat=args.action_repeat,
                 )
 
                 episode_key = f"episode_{episode_global_idx}"
@@ -801,9 +850,28 @@ def main():
         type=str,
         default="first",
         choices=FRAME_AGGREGATIONS,
-        help="How to reduce numeric sensors over each frame_stride window: "
+        help="How to reduce numeric sensors over each storage window: "
         "'first' samples the boundary value (no aggregation), 'mean'/'max'/'sum' "
         "reduce element-wise. RGB/depth images are always sampled, never aggregated.",
+    )
+    parser.add_argument(
+        "--action_repeat",
+        type=int,
+        default=1,
+        help="Action-repeat / frame-skip factor. The policy is queried once per "
+        "block of N control ticks and that single action is re-applied unchanged "
+        "for the whole block; only the block's initial frame is stored. This "
+        "yields larger inter-frame motion (better dynamics for video prediction). "
+        "Mutually exclusive with --frame_stride (1 = disabled).",
+    )
+    parser.add_argument(
+        "--zoom_factor",
+        type=float,
+        default=1.0,
+        help="Optical zoom for all rendered cameras: divides each camera's "
+        "field-of-view (fovy) by this factor so the view narrows onto the scene "
+        "center, enlarging objects and resolving finer detail with no resolution "
+        "loss. Applies to both RGB and depth (>1 zooms in, 1.0 = disabled).",
     )
     parser.add_argument(
         "--cameras",
@@ -876,6 +944,15 @@ def main():
         parser.error("random_walk_max_step must be greater than random_walk_min_step")
     if args.frame_stride < 1:
         parser.error("frame_stride must be a positive integer")
+    if args.action_repeat < 1:
+        parser.error("action_repeat must be a positive integer")
+    if args.frame_stride > 1 and args.action_repeat > 1:
+        parser.error(
+            "--frame_stride and --action_repeat are mutually exclusive; "
+            "set at most one of them above 1"
+        )
+    if args.zoom_factor <= 0.0:
+        parser.error("zoom_factor must be positive")
     if len(set(args.cameras)) != len(args.cameras):
         parser.error("--cameras must not contain duplicate camera names")
 
